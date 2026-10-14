@@ -1,0 +1,17 @@
+# Upstream reference sources — not our product
+orig/
+
+# Build output
+[Bb]in/
+[Oo]bj/
+
+# IDE
+.vs/
+*.user
+
+# NuGet
+*.nupkg
+
+# OS
+Thumbs.db
+.DS_Store

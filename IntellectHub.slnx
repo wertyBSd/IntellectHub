@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="IntellectHub/IntellectHub.csproj" />
+  <Project Path="IntellectHub.Tests/IntellectHub.Tests.csproj" />
+</Solution>
