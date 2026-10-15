@@ -15,6 +15,8 @@ internal sealed class DeepSeekChallenge
 
 internal sealed record UpstreamChunk(string? Content, string? MessageId, string? FinishReason);
 
+internal sealed record SseDelta(string? Content, string? Reasoning, string? FinishReason, string? MessageId);
+
 internal interface IPowSolver
 {
     Task<long> SolveAsync(DeepSeekChallenge challenge, string wasmUrl, CancellationToken ct);
@@ -96,48 +98,73 @@ internal static class DeepSeekJson
     }
 }
 
-internal sealed class SseAccumulator
+internal sealed class SseParser
 {
     private string _lastPath = "";
-    private readonly StringBuilder _content = new();
 
-    public string? MessageId { get; private set; }
-    public string? FinishReason { get; private set; }
-    public string Content => _content.ToString();
-
-    public bool Consume(string dataLine)
+    public SseDelta? Consume(string dataLine)
     {
-        if (string.IsNullOrEmpty(dataLine) || !dataLine.StartsWith("data: ", StringComparison.Ordinal)) return false;
+        if (string.IsNullOrEmpty(dataLine) || !dataLine.StartsWith("data: ", StringComparison.Ordinal)) return null;
         var json = dataLine[6..];
-        if (json.Length == 0) return false;
+        if (json.Length == 0) return null;
         try
         {
             using var doc = JsonDocument.Parse(json);
             var root = doc.RootElement;
-            if (root.TryGetProperty("response_message_id", out var rid) && MessageId is null)
-                MessageId = rid.GetString();
+            string? messageId = null;
+            string? finishReason = null;
+            string? content = null;
+            string? reasoning = null;
+
+            if (root.TryGetProperty("response_message_id", out var rid))
+                messageId = rid.GetString();
             if (root.TryGetProperty("finish_reason", out var fr) && fr.ValueKind == JsonValueKind.String)
-                FinishReason = fr.GetString();
+                finishReason = fr.GetString();
             if (root.TryGetProperty("p", out var p) && p.ValueKind == JsonValueKind.String)
                 _lastPath = p.GetString() ?? "";
             if (root.TryGetProperty("v", out var v) && v.ValueKind != JsonValueKind.Object)
             {
                 if (_lastPath == "response/content")
-                {
-                    var text = v.GetString();
-                    if (text is not null) { _content.Append(text); return true; }
-                }
+                    content = v.GetString();
+                else if (_lastPath == "response/thinking")
+                    reasoning = v.GetString();
                 else if (_lastPath == "response/finish_reason" && v.ValueKind == JsonValueKind.String)
-                {
-                    FinishReason = v.GetString();
-                }
+                    finishReason = v.GetString();
                 else if (_lastPath == "response/status" && v.ValueKind == JsonValueKind.String && v.GetString() != "FINISHED")
-                {
-                    FinishReason = v.GetString();
-                }
+                    finishReason = v.GetString();
             }
+
+            if (content is null && reasoning is null && finishReason is null && messageId is null)
+                return null;
+
+            return new SseDelta(content, reasoning, finishReason, messageId);
         }
-        catch (JsonException) { }
-        return false;
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+}
+
+internal sealed class SseAccumulator
+{
+    private readonly SseParser _parser = new();
+    private readonly StringBuilder _content = new();
+    private readonly StringBuilder _reasoning = new();
+
+    public string? MessageId { get; private set; }
+    public string? FinishReason { get; private set; }
+    public string Content => _content.ToString();
+    public string ReasoningContent => _reasoning.ToString();
+
+    public void Consume(string dataLine)
+    {
+        var delta = _parser.Consume(dataLine);
+        if (delta is null) return;
+
+        if (delta.MessageId is not null) MessageId ??= delta.MessageId;
+        if (delta.FinishReason is not null) FinishReason = delta.FinishReason;
+        if (delta.Content is not null) _content.Append(delta.Content);
+        if (delta.Reasoning is not null) _reasoning.Append(delta.Reasoning);
     }
 }

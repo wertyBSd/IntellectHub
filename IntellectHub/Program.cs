@@ -13,6 +13,13 @@ internal static class Program
         }
 
         ApplicationConfiguration.Initialize();
+
+        Application.ThreadException += (_, e) => AppLog.Error("Unhandled UI exception", e.Exception);
+        AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+        {
+            if (e.ExceptionObject is Exception ex) AppLog.Error("Unhandled exception", ex);
+        };
+
         Application.Run(new MainForm());
     }
 }

@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace IntellectHub;
 
@@ -7,8 +8,9 @@ internal sealed class AccountConfig
     public string? Name { get; set; }
     public string? Token { get; set; }
     public string? Cookie { get; set; }
-    public string? HifDliq { get; set; }
-    public string? HifLeim { get; set; }
+    [JsonPropertyName("hif_dliq")] public string? HifDliq { get; set; }
+    [JsonPropertyName("hif_leim")] public string? HifLeim { get; set; }
+    public string? WasmUrl { get; set; }
     public bool? Enabled { get; set; }
 }
 
@@ -173,6 +175,47 @@ internal sealed class AccountPool
             _busy.RemoveWhere(id => _accounts.All(a => a.Id != id));
 
             return new AccountsFile { List = result, Added = added, Kept = kept, Removed = removed, Relogged = relogged };
+        }
+    }
+
+    public const long DefaultCooldownMs = 10 * 60 * 1000;
+
+    private static long Now() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+    public (int Ready, int Total) Snapshot()
+    {
+        var now = Now();
+        lock (_gate) return (_accounts.Count(a => a.CanServe(now)), _accounts.Count);
+    }
+
+    public void MarkRateLimited(Account account, long? retryAfterMs)
+    {
+        var ms = retryAfterMs is > 0 ? retryAfterMs.Value : DefaultCooldownMs;
+        lock (_gate)
+        {
+            account.CooldownUntil = Math.Max(account.CooldownUntil, Now() + ms);
+            account.CooldownReason = "rate_limit";
+        }
+    }
+
+    public void MarkAuthFailed(Account account)
+    {
+        lock (_gate)
+        {
+            account.CooldownUntil = Math.Max(account.CooldownUntil, Now() + DefaultCooldownMs);
+            account.CooldownReason = "auth";
+        }
+    }
+
+    public void MarkSuccess(Account account)
+    {
+        lock (_gate)
+        {
+            account.CooldownUntil = 0;
+            account.CooldownReason = null;
+            account.Failures = 0;
+            account.LastSuccessAt = Now();
+            account.LastUsedAt = Now();
         }
     }
 

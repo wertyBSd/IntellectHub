@@ -1,17 +1,23 @@
 using System.Net;
-using System.Text;
 
 namespace IntellectHub;
 
 internal sealed class ProxyServer
 {
     private readonly AppConfig _config;
+    private readonly RequestRouter _router;
+
     private HttpListener? _listener;
     private CancellationTokenSource? _cts;
 
     public bool IsRunning => _listener?.IsListening == true;
 
-    public ProxyServer(AppConfig config) => _config = config;
+    public ProxyServer(AppConfig config)
+    {
+        _config = config;
+        var services = new AppServices(config);
+        _router = RequestRouter.CreateDefault(new ChatCompletionService(services.Pool, services.Client), services.Pool);
+    }
 
     public void Start()
     {
@@ -60,46 +66,23 @@ internal sealed class ProxyServer
                 return;
             }
 
-            _ = Task.Run(() => HandleAsync(context), token);
+            _ = Task.Run(() => HandleAsync(context, token), token);
         }
     }
 
-    private async Task HandleAsync(HttpListenerContext context)
+    private async Task HandleAsync(HttpListenerContext context, CancellationToken token)
     {
-        var request = context.Request;
-        var path = request.Url?.AbsolutePath ?? "/";
+        var method = context.Request.HttpMethod;
+        var path = context.Request.Url?.AbsolutePath ?? "/";
 
         try
         {
-            switch (path)
-            {
-                case "/health":
-                    await WriteJsonAsync(context, 200, "{\"status\":\"ok\"}");
-                    break;
-                case "/v1/models":
-                    await WriteJsonAsync(context, 200, "{\"object\":\"list\",\"data\":[]}");
-                    break;
-                default:
-                    AppLog.Warn($"{request.HttpMethod} {path} -> 501 (не портировано)");
-                    await WriteJsonAsync(context, 501, "{\"error\":{\"message\":\"Not implemented yet\",\"type\":\"not_implemented\"}}");
-                    break;
-            }
+            await _router.HandleAsync(context, token);
         }
         catch (Exception ex)
         {
-            AppLog.Error($"{request.HttpMethod} {path} -> {ex.Message}");
+            AppLog.Error($"{method} {path} -> {ex.Message}");
             try { context.Response.Abort(); } catch { }
         }
-    }
-
-    private static async Task WriteJsonAsync(HttpListenerContext context, int status, string json)
-    {
-        var buffer = Encoding.UTF8.GetBytes(json);
-        var response = context.Response;
-        response.StatusCode = status;
-        response.ContentType = "application/json; charset=utf-8";
-        response.ContentLength64 = buffer.Length;
-        await response.OutputStream.WriteAsync(buffer);
-        response.Close();
     }
 }

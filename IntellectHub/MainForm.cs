@@ -4,6 +4,8 @@ namespace IntellectHub;
 
 internal sealed class MainForm : Form
 {
+    private const int MaxLogLines = 2000;
+
     private readonly AppConfig _config = AppConfig.Load();
     private readonly ProxyServer _server;
     private readonly NotifyIcon _tray;
@@ -14,15 +16,20 @@ internal sealed class MainForm : Form
     private readonly TextBox _apiKey = new();
     private readonly CheckBox _autoStart = new();
     private readonly CheckBox _minimizeToTray = new();
+    private readonly CheckBox _startMinimized = new();
     private readonly CheckBox _autoScroll = new();
     private readonly Label _status = new();
     private readonly Button _toggle = new();
 
+    private SplitContainer _split = null!;
     private bool _reallyExit;
+    private bool _startHidden;
+    private bool _splitReady;
 
     public MainForm()
     {
         _server = new ProxyServer(_config);
+        _startHidden = _config.StartMinimized;
 
         Text = "IntellectHub";
         MinimumSize = new Size(760, 560);
@@ -45,6 +52,12 @@ internal sealed class MainForm : Form
         menu.Items.Add("Закрыть", null, (_, _) => ExitApp());
         _tray.ContextMenuStrip = menu;
         _tray.DoubleClick += (_, _) => RestoreWindow();
+
+        if (_startHidden)
+        {
+            WindowState = FormWindowState.Minimized;
+            ShowInTaskbar = false;
+        }
 
         BuildLayout();
 
@@ -91,7 +104,7 @@ internal sealed class MainForm : Form
         header.Controls.AddRange(new Control[] { title, _status, _toggle });
         header.Resize += (_, _) => _toggle.Left = header.Width - _toggle.Width - 18;
 
-        var split = new SplitContainer
+        _split = new SplitContainer
         {
             Dock = DockStyle.Fill,
             Orientation = Orientation.Vertical,
@@ -99,20 +112,29 @@ internal sealed class MainForm : Form
             BackColor = Theme.Border,
             FixedPanel = FixedPanel.Panel1
         };
-        split.Panel1.BackColor = Theme.Panel;
-        split.Panel2.BackColor = Theme.Background;
+        _split.Panel1.BackColor = Theme.Panel;
+        _split.Panel2.BackColor = Theme.Background;
 
-        split.Panel1.Controls.Add(BuildSettings());
-        split.Panel2.Controls.Add(BuildConsole());
+        _split.Panel1.Controls.Add(BuildSettings());
+        _split.Panel2.Controls.Add(BuildConsole());
 
-        Controls.Add(split);
+        Controls.Add(_split);
         Controls.Add(header);
 
-        Load += (_, _) =>
+        Load += (_, _) => UpdateStatus();
+    }
+
+    protected override void OnShown(EventArgs e)
+    {
+        base.OnShown(e);
+        if (_splitReady) return;
+
+        var max = _split.Width - _split.Panel2MinSize;
+        if (max > _split.Panel1MinSize)
         {
-            split.SplitterDistance = 300;
-            UpdateStatus();
-        };
+            _split.SplitterDistance = Math.Clamp(300, _split.Panel1MinSize, max);
+            _splitReady = true;
+        }
     }
 
     private Control BuildSettings()
@@ -142,13 +164,15 @@ internal sealed class MainForm : Form
 
         _autoStart.Text = "Запускать сервер при старте";
         _minimizeToTray.Text = "Сворачивать в трей при закрытии";
+        _startMinimized.Text = "Запускать свёрнутым в трей";
         _autoScroll.Text = "Автопрокрутка лога";
 
         _autoStart.Checked = _config.AutoStartServer;
         _minimizeToTray.Checked = _config.MinimizeToTray;
+        _startMinimized.Checked = _config.StartMinimized;
         _autoScroll.Checked = _config.AutoScrollLog;
 
-        foreach (var cb in new[] { _autoStart, _minimizeToTray, _autoScroll })
+        foreach (var cb in new[] { _autoStart, _minimizeToTray, _startMinimized, _autoScroll })
         {
             cb.ForeColor = Theme.Text;
             cb.FlatStyle = FlatStyle.Flat;
@@ -157,6 +181,26 @@ internal sealed class MainForm : Form
             flow.Controls.Add(cb);
         }
 
+        var buttons = new FlowLayoutPanel
+        {
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            AutoSize = true,
+            Margin = new Padding(0, 14, 0, 0)
+        };
+
+        var login = new Button
+        {
+            Text = "Аккаунты",
+            FlatStyle = FlatStyle.Flat,
+            BackColor = Theme.PanelAlt,
+            ForeColor = Theme.Text,
+            Size = new Size(120, 30),
+            Margin = new Padding(0, 0, 8, 0)
+        };
+        login.FlatAppearance.BorderColor = Theme.Border;
+        login.Click += (_, _) => OpenLogin();
+
         var save = new Button
         {
             Text = "Сохранить",
@@ -164,11 +208,14 @@ internal sealed class MainForm : Form
             BackColor = Theme.PanelAlt,
             ForeColor = Theme.Text,
             Size = new Size(120, 30),
-            Margin = new Padding(0, 14, 0, 0)
+            Margin = new Padding(0)
         };
         save.FlatAppearance.BorderColor = Theme.Border;
         save.Click += (_, _) => SaveSettings();
-        flow.Controls.Add(save);
+
+        buttons.Controls.Add(login);
+        buttons.Controls.Add(save);
+        flow.Controls.Add(buttons);
 
         return flow;
     }
@@ -248,6 +295,17 @@ internal sealed class MainForm : Form
         _log.SelectionColor = color;
         _log.AppendText($"[{prefix}] {message}\n");
 
+        if (_log.Lines.Length > MaxLogLines)
+        {
+            var cut = _log.Lines.Length - MaxLogLines;
+            var first = _log.GetFirstCharIndexFromLine(cut);
+            if (first > 0)
+            {
+                _log.Select(0, first);
+                _log.SelectedText = string.Empty;
+            }
+        }
+
         if (_config.AutoScrollLog && _autoScroll.Checked)
             _log.ScrollToCaret();
     }
@@ -268,6 +326,9 @@ internal sealed class MainForm : Form
 
     private void StartServer()
     {
+        _config.Host = _host.Text.Trim();
+        _config.Port = int.TryParse(_port.Text.Trim(), out var p) ? p : _config.Port;
+
         try
         {
             _server.Start();
@@ -288,6 +349,18 @@ internal sealed class MainForm : Form
         _toggle.Text = running ? "Стоп" : "Старт";
     }
 
+    private void OpenLogin()
+    {
+        var target = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "IntellectHub",
+            _config.AuthPath);
+
+        using var login = new LoginForm(target);
+        if (login.ShowDialog(this) == DialogResult.OK)
+            AppLog.Ok($"Аккаунт добавлен: {Path.GetFileName(target)}");
+    }
+
     private void SaveSettings()
     {
         _config.Host = _host.Text.Trim();
@@ -295,6 +368,7 @@ internal sealed class MainForm : Form
         _config.ApiKey = _apiKey.Text;
         _config.AutoStartServer = _autoStart.Checked;
         _config.MinimizeToTray = _minimizeToTray.Checked;
+        _config.StartMinimized = _startMinimized.Checked;
         _config.AutoScrollLog = _autoScroll.Checked;
         _config.Save();
         AppLog.Ok("Настройки сохранены");
@@ -302,9 +376,21 @@ internal sealed class MainForm : Form
 
     private void RestoreWindow()
     {
+        ShowInTaskbar = true;
         Show();
         WindowState = FormWindowState.Normal;
         Activate();
+    }
+
+    protected override void SetVisibleCore(bool value)
+    {
+        if (_startHidden)
+        {
+            _startHidden = false;
+            base.SetVisibleCore(false);
+            return;
+        }
+        base.SetVisibleCore(value);
     }
 
     private void ExitApp()
