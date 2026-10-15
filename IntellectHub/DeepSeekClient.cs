@@ -69,15 +69,15 @@ internal sealed class DeepSeekClient
         using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
         await EnsureCompletionStreamAsync(response, ct);
 
-        var parser = new SseParser();
+        var accumulator = new SseAccumulator();
         await using var stream = await response.Content.ReadAsStreamAsync(ct);
         using var reader = new StreamReader(stream, Encoding.UTF8);
         while (true)
         {
             var line = await reader.ReadLineAsync(ct);
             if (line is null) break;
-            var delta = parser.Consume(line);
-            if (delta is not null) await onDelta(delta);
+            if (accumulator.Consume(line) && accumulator.LastDelta is { } delta)
+                await onDelta(delta);
         }
     }
 

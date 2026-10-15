@@ -1,4 +1,4 @@
-using System.Net;
+﻿using System.Net;
 using System.Text.Json;
 
 namespace IntellectHub;
@@ -11,6 +11,8 @@ internal sealed class ReadyzHandler : IRequestHandler
 
     public bool CanHandle(string method, string path) =>
         method == "GET" && path == "/readyz";
+
+    public bool RequiresAuth => false;
 
     public Task HandleAsync(HttpListenerContext context, CancellationToken ct)
     {

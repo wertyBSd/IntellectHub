@@ -1,22 +1,27 @@
-using System.Net;
+﻿using System.Net;
 
 namespace IntellectHub;
 
 internal sealed class ProxyServer
 {
     private readonly AppConfig _config;
+    private readonly AppServices _services;
     private readonly RequestRouter _router;
 
     private HttpListener? _listener;
     private CancellationTokenSource? _cts;
 
     public bool IsRunning => _listener?.IsListening == true;
+    public ApiKeyStore ApiKeys => _services.ApiKeys;
 
     public ProxyServer(AppConfig config)
     {
         _config = config;
-        var services = new AppServices(config);
-        _router = RequestRouter.CreateDefault(new ChatCompletionService(services.Pool, services.Client), services.Pool);
+        _services = new AppServices(config);
+        _router = RequestRouter.CreateDefault(
+            new ChatCompletionService(_services.Pool, _services.Client),
+            _services.Pool,
+            _services.ApiKeys);
     }
 
     public void Start()
@@ -34,16 +39,16 @@ internal sealed class ProxyServer
 
     public void Stop()
     {
-        var listener = _listener;
+        var listener = Interlocked.Exchange(ref _listener, null);
         if (listener is null) return;
 
-        _listener = null;
-        _cts?.Cancel();
-        _cts?.Dispose();
-        _cts = null;
+        var cts = Interlocked.Exchange(ref _cts, null);
+        try { cts?.Cancel(); } catch { }
 
         try { listener.Stop(); } catch { }
         try { listener.Close(); } catch { }
+
+        cts?.Dispose();
     }
 
     private async Task AcceptLoopAsync(HttpListener listener, CancellationToken token)

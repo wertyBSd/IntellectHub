@@ -60,6 +60,7 @@ internal sealed class MainForm : Form
         }
 
         BuildLayout();
+        CreateHandle();
 
         AppLog.Written += OnLog;
         AppLog.Info("IntellectHub запущен");
@@ -214,6 +215,19 @@ internal sealed class MainForm : Form
         save.Click += (_, _) => SaveSettings();
 
         buttons.Controls.Add(login);
+        var keys = new Button
+        {
+            Text = "Ключи",
+            FlatStyle = FlatStyle.Flat,
+            BackColor = Theme.PanelAlt,
+            ForeColor = Theme.Text,
+            Size = new Size(120, 30),
+            Margin = new Padding(0, 0, 8, 0)
+        };
+        keys.FlatAppearance.BorderColor = Theme.Border;
+        keys.Click += (_, _) => OpenKeys();
+
+        buttons.Controls.Add(keys);
         buttons.Controls.Add(save);
         flow.Controls.Add(buttons);
 
@@ -359,6 +373,11 @@ internal sealed class MainForm : Form
         using var login = new LoginForm(target);
         if (login.ShowDialog(this) == DialogResult.OK)
             AppLog.Ok($"Аккаунт добавлен: {Path.GetFileName(target)}");
+    }
+    private void OpenKeys()
+    {
+        using var keys = new KeysForm(_server.ApiKeys);
+        keys.ShowDialog(this);
     }
 
     private void SaveSettings()
@@ -374,12 +393,14 @@ internal sealed class MainForm : Form
         AppLog.Ok("Настройки сохранены");
     }
 
-    private void RestoreWindow()
+        private void RestoreWindow()
     {
+        if (_reallyExit || IsDisposed || Disposing) return;
         ShowInTaskbar = true;
-        Show();
-        WindowState = FormWindowState.Normal;
+        if (!Visible) Show();
+        if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
         Activate();
+        BringToFront();
     }
 
     protected override void SetVisibleCore(bool value)
@@ -393,9 +414,18 @@ internal sealed class MainForm : Form
         base.SetVisibleCore(value);
     }
 
-    private void ExitApp()
+        private void ExitApp()
     {
+        if (_reallyExit) return;
         _reallyExit = true;
+
+        if (IsDisposed || Disposing)
+        {
+            _tray.Visible = false;
+            Application.Exit();
+            return;
+        }
+
         Close();
     }
 
