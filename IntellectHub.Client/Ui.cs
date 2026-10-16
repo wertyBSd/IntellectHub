@@ -39,6 +39,7 @@ public sealed class Ui : IDisposable
     private int _frame;
     private int _histCursor;
     private int _scrollFromBottom;
+    private int _liveIndex = -1;
     private bool _busy;
     private bool _disposed;
 
@@ -83,11 +84,41 @@ public sealed class Ui : IDisposable
             Console.WriteLine(text);
     }
 
+    public void BeginStream(ConsoleColor color = ConsoleColor.White)
+    {
+        lock (_gate)
+        {
+            _transcript.Add(new Entry("", ToColor(color)));
+            _liveIndex = _transcript.Count - 1;
+            _scrollFromBottom = 0;
+        }
+    }
+
+    public void PushStream(string delta)
+    {
+        if (delta.Length == 0) return;
+        lock (_gate)
+        {
+            if (_liveIndex < 0 || _liveIndex >= _transcript.Count) return;
+            var entry = _transcript[_liveIndex];
+            _transcript[_liveIndex] = entry with { Text = entry.Text + delta };
+            _scrollFromBottom = 0;
+        }
+        if (!_interactive) Console.Write(delta);
+    }
+
+    public void EndStream()
+    {
+        lock (_gate) _liveIndex = -1;
+        if (!_interactive) Console.WriteLine();
+    }
+
     public void Clear()
     {
         lock (_gate)
         {
             _transcript.Clear();
+            _liveIndex = -1;
             _scrollFromBottom = 0;
         }
         if (!_interactive)
@@ -304,11 +335,45 @@ public sealed class Ui : IDisposable
 
     private IRenderable BuildSidebar()
     {
-        var rows = new List<IRenderable> { new Markup("[gold1]tools[/]") };
-        if (_tools.Count == 0)
-            rows.Add(new Markup("  [grey](none)[/]"));
-        foreach (var tool in _tools)
-            rows.Add(new Markup($"  [aqua]{Markup.Escape(tool)}[/]"));
+        var rows = new List<IRenderable>();
+
+        var bodyHeight = Math.Max(8, SafeWindowHeight() - HeaderHeight - FooterHeight - 2);
+        var toolRoom = bodyHeight - 14;
+        if (toolRoom >= 1)
+        {
+            rows.Add(new Markup("[gold1]tools[/]"));
+
+            if (_tools.Count == 0)
+            {
+                rows.Add(new Markup("  [grey](none)[/]"));
+            }
+            else
+            {
+                const int columns = 2;
+                const int colWidth = 10;
+                var linesNeeded = (_tools.Count + columns - 1) / columns;
+                var shown = Math.Min(linesNeeded, toolRoom);
+                var truncated = shown * columns < _tools.Count;
+                var slots = truncated ? shown * columns - 1 : _tools.Count;
+
+                for (var r = 0; r < shown; r++)
+                {
+                    var line = new StringBuilder();
+                    for (var c = 0; c < columns; c++)
+                    {
+                        var index = r * columns + c;
+                        if (index >= slots) break;
+                        var name = _tools[index];
+                        if (name.Length >= colWidth) name = name[..(colWidth - 1)];
+                        line.Append(name.PadRight(colWidth));
+                    }
+                    rows.Add(new Markup("  [aqua]" + Markup.Escape(line.ToString().TrimEnd()) + "[/]"));
+                }
+
+                if (truncated)
+                    rows.Add(new Markup($"  [grey]+{_tools.Count - slots} more[/]"));
+            }
+        }
 
         rows.Add(new Text(""));
         rows.Add(new Markup("[gold1]commands[/]"));

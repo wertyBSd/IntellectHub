@@ -125,7 +125,7 @@ async Task RunTurnAsync()
         if (!reply.HasToolCalls)
         {
             if (reply.Text.Trim().Length > 0)
-                screen.Write(reply.Text.Trim(), ConsoleColor.White);
+                await RevealAsync(reply.Text.Trim());
             history.Add(new ChatMessage { Role = "assistant", Content = JsonValue.Create(reply.Text) });
             return;
         }
@@ -287,6 +287,24 @@ static string Trim(string value, int max)
 {
     var single = value.Replace('\r', ' ').Replace('\n', ' ').Trim();
     return single.Length > max ? single[..max] + "..." : single;
+}
+
+async Task RevealAsync(string text)
+{
+    const int chunk = 3;
+    if (text.Length <= chunk)
+    {
+        screen.Write(text, ConsoleColor.White);
+        return;
+    }
+
+    screen.BeginStream(ConsoleColor.White);
+    for (var i = 0; i < text.Length; i += chunk)
+    {
+        screen.PushStream(text.Substring(i, Math.Min(chunk, text.Length - i)));
+        await Task.Delay(8);
+    }
+    screen.EndStream();
 }
 
 async Task CheckHealthAsync()
