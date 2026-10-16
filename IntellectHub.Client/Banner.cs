@@ -1,53 +1,38 @@
-using System.Text;
+using Spectre.Console;
+using Spectre.Console.Rendering;
 
 namespace IntellectHub.Client;
 
 public static class Banner
 {
-    public const string Version = "0.2.0";
+    public const string Version = "0.3.1";
 
     private static readonly string[] Logo =
     {
-        "            ╲   │   ╱",
-        "             ╲  │  ╱",
-        "              ╲ │ ╱",
-        "               ╲│╱",
-        "        ────────◆────────",
-        "               ╱│╲",
-        "              ╱ │ ╲",
-        "             ╱  │  ╲",
-        "            ╱   │   ╲",
+        "╲   │   ╱",
+        "────◆────",
+        "╱   │   ╲",
     };
 
-    public static void Print(Screen screen, ClientConfig config)
+    public static IRenderable Header(ClientConfig config, Project project)
     {
-        screen.Write("");
-        foreach (var line in Logo)
-            screen.WriteRaw(Paint(line));
-        screen.WriteRaw("");
-        screen.WriteRaw("  \x1b[97mI N T E L L E C T   H U B\x1b[0m");
-        screen.WriteRaw($"  \x1b[90myour private model hub   v{Version}\x1b[0m");
-        screen.WriteRaw("");
-        screen.Write("  server  " + config.BaseUrl, ConsoleColor.DarkGray);
-        screen.Write("  model   " + config.Model, ConsoleColor.DarkGray);
-        screen.Write("");
-    }
+        var logo = new Markup(string.Join('\n', Logo.Select(line => $"[aqua]{Markup.Escape(line)}[/]")));
 
-    private static string Paint(string line)
-    {
-        var sb = new StringBuilder("  ");
-        foreach (var ch in line)
+        var info = new Markup(
+            $"[bold white]I N T E L L E C T   H U B[/] [grey]v{Version}[/]\n" +
+            $"[grey]server [/] [silver]{Markup.Escape(config.BaseUrl)}[/]  [grey]model[/] [silver]{Markup.Escape(config.Model)}[/]\n" +
+            $"[grey]project[/] [silver]{Markup.Escape(project.Root)}[/]");
+
+        var grid = new Grid();
+        grid.AddColumn(new GridColumn().NoWrap().Padding(0, 0, 2, 0));
+        grid.AddColumn(new GridColumn());
+        grid.AddRow(logo, info);
+
+        return new Panel(grid)
         {
-            sb.Append(ch switch
-            {
-                '◆' => "\x1b[96m",
-                '│' => "\x1b[90m",
-                '╲' or '╱' => "\x1b[36m",
-                '─' => "\x1b[90m",
-                _ => "\x1b[0m",
-            });
-            sb.Append(ch).Append("\x1b[0m");
-        }
-        return sb.ToString();
+            Border = BoxBorder.Rounded,
+            BorderStyle = new Style(Color.Gold1),
+            Padding = new Padding(1, 0, 1, 0),
+        };
     }
 }

@@ -23,6 +23,9 @@ public sealed class ClientConfig
     [JsonPropertyName("temperature")]
     public double Temperature { get; set; } = 1.0;
 
+    [JsonPropertyName("project")]
+    public string? Project { get; set; }
+
     [JsonIgnore]
     public static string ConfigDir =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "IntellectHub");

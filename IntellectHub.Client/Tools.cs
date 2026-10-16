@@ -57,6 +57,39 @@ public sealed class ToolRegistry
                 },
                 ["required"] = new JsonArray("command"),
             }),
+        Spec("edit", "Replace the first occurrence of oldString with newString in a workspace file.",
+            new JsonObject
+            {
+                ["type"] = "object",
+                ["properties"] = new JsonObject
+                {
+                    ["path"] = new JsonObject { ["type"] = "string" },
+                    ["oldString"] = new JsonObject { ["type"] = "string", ["description"] = "Exact text to replace; must appear exactly once." },
+                    ["newString"] = new JsonObject { ["type"] = "string", ["description"] = "Replacement text." },
+                },
+                ["required"] = new JsonArray("path", "oldString", "newString"),
+            }),
+        Spec("grep", "Search file contents with a regular expression and return matching lines.",
+            new JsonObject
+            {
+                ["type"] = "object",
+                ["properties"] = new JsonObject
+                {
+                    ["pattern"] = new JsonObject { ["type"] = "string", ["description"] = ".NET regular expression." },
+                    ["path"] = new JsonObject { ["type"] = "string", ["description"] = "File or directory to search; defaults to the workspace root." },
+                },
+                ["required"] = new JsonArray("pattern"),
+            }),
+        Spec("check", "Validate a workspace file: parse JSON/XML or report basic file facts.",
+            new JsonObject
+            {
+                ["type"] = "object",
+                ["properties"] = new JsonObject
+                {
+                    ["path"] = new JsonObject { ["type"] = "string" },
+                },
+                ["required"] = new JsonArray("path"),
+            }),
     ];
 
     public async Task<ToolResult> ExecuteAsync(ToolCall call, CancellationToken ct = default)
@@ -80,6 +113,9 @@ public sealed class ToolRegistry
                 "write" => Write(GetString(args, "path"), GetString(args, "content")),
                 "glob" => Glob(GetString(args, "pattern")),
                 "bash" => await BashAsync(GetString(args, "command"), ct),
+                "edit" => Edit(GetString(args, "path"), GetString(args, "oldString"), GetString(args, "newString")),
+                "grep" => Grep(GetString(args, "pattern"), GetString(args, "path")),
+                "check" => Check(GetString(args, "path")),
                 _ => new ToolResult($"Unknown tool: {call.Name}", IsError: true),
             };
         }
@@ -102,6 +138,87 @@ public sealed class ToolRegistry
         Directory.CreateDirectory(Path.GetDirectoryName(full) ?? _workspace);
         File.WriteAllText(full, content);
         return new ToolResult($"Wrote {content.Length} chars to {path}");
+    }
+
+    private ToolResult Edit(string path, string oldString, string newString)
+    {
+        var full = Resolve(path);
+        if (!File.Exists(full)) return new ToolResult($"File not found: {path}", IsError: true);
+
+        var text = File.ReadAllText(full);
+        var index = text.IndexOf(oldString, StringComparison.Ordinal);
+        if (index < 0) return new ToolResult("oldString not found.", IsError: true);
+        if (text.IndexOf(oldString, index + 1, StringComparison.Ordinal) >= 0)
+            return new ToolResult("oldString is not unique; add more context.", IsError: true);
+
+        File.WriteAllText(full, text[..index] + newString + text[(index + oldString.Length)..]);
+        return new ToolResult($"Edited {path}");
+    }
+
+    private ToolResult Grep(string pattern, string path)
+    {
+        Regex regex;
+        try
+        {
+            regex = new Regex(pattern);
+        }
+        catch (ArgumentException ex)
+        {
+            return new ToolResult($"Invalid pattern: {ex.Message}", IsError: true);
+        }
+
+        var root = string.IsNullOrWhiteSpace(path) ? _workspace : Resolve(path);
+        IEnumerable<string> files = File.Exists(root)
+            ? [root]
+            : Directory.Exists(root)
+                ? Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories)
+                : [];
+
+        var hits = new List<string>();
+        foreach (var file in files)
+        {
+            string[] lines;
+            try { lines = File.ReadAllLines(file); }
+            catch (IOException) { continue; }
+
+            var rel = Path.GetRelativePath(_workspace, file).Replace('\\', '/');
+            for (var i = 0; i < lines.Length; i++)
+            {
+                if (!regex.IsMatch(lines[i])) continue;
+                hits.Add($"{rel}:{i + 1}: {lines[i].Trim()}");
+                if (hits.Count >= 200) break;
+            }
+            if (hits.Count >= 200) break;
+        }
+
+        return hits.Count == 0
+            ? new ToolResult("No matches.")
+            : new ToolResult(string.Join('\n', hits));
+    }
+
+    private ToolResult Check(string path)
+    {
+        var full = Resolve(path);
+        if (!File.Exists(full)) return new ToolResult($"File not found: {path}", IsError: true);
+
+        var text = File.ReadAllText(full);
+        var lineCount = text.Length == 0 ? 0 : text.Split('\n').Length;
+        var info = new StringBuilder($"{path}: {text.Length} chars, {lineCount} lines");
+
+        var ext = Path.GetExtension(full).ToLowerInvariant();
+        switch (ext)
+        {
+            case ".json":
+                try { JsonDocument.Parse(text).Dispose(); info.Append("\njson: valid"); }
+                catch (JsonException ex) { info.Append("\njson: invalid - " + ex.Message); }
+                break;
+            case ".xml":
+                try { System.Xml.Linq.XDocument.Parse(text); info.Append("\nxml: valid"); }
+                catch (System.Xml.XmlException ex) { info.Append("\nxml: invalid - " + ex.Message); }
+                break;
+        }
+
+        return new ToolResult(info.ToString());
     }
 
     private ToolResult Glob(string pattern)
