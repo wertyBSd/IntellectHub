@@ -42,13 +42,22 @@ internal static class PromptFormatter
         return part.ToString();
     }
 
-    public static (string Prompt, string SystemPrompt) Format(IReadOnlyList<ChatMessage> messages)
+    public static (string Prompt, string SystemPrompt) Format(IReadOnlyList<ChatMessage> messages) =>
+        Format(messages, 0);
+
+    /// <summary>
+    /// Flattens the conversation into plain text, skipping the first
+    /// <paramref name="startIndex"/> messages. A live remote session already holds
+    /// those, and sending them again would show the model the same history twice.
+    /// </summary>
+    public static (string Prompt, string SystemPrompt) Format(IReadOnlyList<ChatMessage> messages, int startIndex)
     {
         var system = new StringBuilder();
         var conversation = new StringBuilder();
 
-        foreach (var message in messages)
+        for (var index = Math.Max(0, startIndex); index < messages.Count; index++)
         {
+            var message = messages[index];
             var role = message.Role ?? "user";
 
             if (role == "system")

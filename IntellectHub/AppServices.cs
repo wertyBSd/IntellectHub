@@ -11,11 +11,15 @@ internal sealed class AppServices
 
     public AppServices(AppConfig config)
     {
-        Config = config;
-        Pool = new AccountPool(AppDataRoot);
+        Config = config.Normalize();
+
+        Pool = new AccountPool(AppDataRoot) { CooldownMs = Config.AccountCooldownSeconds * 1000L };
         ApiKeys = new ApiKeyStore(AppDataRoot);
-        var http = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
-        Client = new DeepSeekClient(http, new WasmtimePowSolverProvider(http));
+
+        // Timeout is a safety net; the per-attempt budget is enforced by the caller,
+        // because HttpClient.Timeout does not cover reading a streamed body.
+        var http = new HttpClient { Timeout = TimeSpan.FromSeconds(Config.UpstreamTimeoutSeconds) };
+        Client = new DeepSeekClient(http, new WasmtimePowSolverProvider(http), Config.UpstreamTimeoutSeconds);
     }
 
     public static string AppDataRoot => Path.Combine(

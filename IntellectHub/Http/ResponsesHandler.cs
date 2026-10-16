@@ -35,50 +35,61 @@ internal sealed class ResponsesHandler : IRequestHandler
             return;
         }
 
+        CompletionResult result;
         try
         {
-            var result = await _service.CompleteAsync(ToCompletionRequest(request), ct);
-            var id = "resp_" + (result.MessageId ?? Guid.NewGuid().ToString("N"));
-            var modelId = ModelRegistry.Canonicalize(request.Model);
-            var created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-
-            var payload = JsonSerializer.Serialize(new
-            {
-                id,
-                @object = "response",
-                created_at = created,
-                status = "completed",
-                model = modelId,
-                output = new[]
-                {
-                    new
-                    {
-                        type = "message",
-                        id = "msg_" + Guid.NewGuid().ToString("N"),
-                        role = "assistant",
-                        status = "completed",
-                        content = new[]
-                        {
-                            new { type = "output_text", text = result.Content, annotations = Array.Empty<object>() },
-                        },
-                    },
-                },
-                usage = new { input_tokens = 0, output_tokens = 0, total_tokens = 0 },
-            });
-
-            await HttpResponses.WriteJsonAsync(context, 200, payload);
+            var chatRequest = ToCompletionRequest(request);
+            chatRequest.SessionKey = RequestContext.SessionKey(context);
+            result = await _service.CompleteAsync(chatRequest, ct);
         }
         catch (UpstreamException ex)
         {
-            var type = ex.StatusCode switch
-            {
-                401 or 403 => "authentication_error",
-                429 => "rate_limit_error",
-                503 => "service_unavailable",
-                _ => "upstream_error",
-            };
-            await HttpResponses.WriteErrorAsync(context, ex.StatusCode, ex.Message, type);
+            await HttpResponses.WriteUpstreamErrorAsync(context, ex);
+            return;
         }
+
+        var id = "resp_" + (result.MessageId ?? Guid.NewGuid().ToString("N"));
+        var modelId = ModelRegistry.Canonicalize(request.Model);
+        var created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+        // The Responses API models a tool call as its own output item, not as message text.
+        object[] output = result.HasToolCalls
+            ? result.ToolCalls.Select(call => (object)new
+            {
+                type = "function_call",
+                id = "fc_" + Guid.NewGuid().ToString("N"),
+                call_id = "call_" + Guid.NewGuid().ToString("N")[..24],
+                name = call.Name,
+                arguments = call.Arguments,
+                status = "completed",
+            }).ToArray()
+            :
+            [
+                new
+                {
+                    type = "message",
+                    id = "msg_" + Guid.NewGuid().ToString("N"),
+                    role = "assistant",
+                    status = "completed",
+                    content = new[]
+                    {
+                        new { type = "output_text", text = result.Content, annotations = Array.Empty<object>() },
+                    },
+                },
+            ];
+
+        var payload = JsonSerializer.Serialize(new
+        {
+            id,
+            @object = "response",
+            created_at = created,
+            status = "completed",
+            model = modelId,
+            output,
+            usage = new { input_tokens = 0, output_tokens = 0, total_tokens = 0 },
+        });
+
+        await HttpResponses.WriteJsonAsync(context, 200, payload);
     }
 
     private static ChatCompletionRequest ToCompletionRequest(ResponsesRequest request)
@@ -99,6 +110,7 @@ internal sealed class ResponsesHandler : IRequestHandler
             Model = request.Model,
             Messages = messages,
             Stream = request.Stream,
+            Tools = request.Tools,
         };
     }
 
@@ -131,5 +143,6 @@ internal sealed class ResponsesHandler : IRequestHandler
         [JsonPropertyName("input")] public JsonElement Input { get; set; }
         [JsonPropertyName("instructions")] public JsonElement Instructions { get; set; }
         [JsonPropertyName("stream")] public bool Stream { get; set; }
+        [JsonPropertyName("tools")] public List<ToolDefinition>? Tools { get; set; }
     }
 }

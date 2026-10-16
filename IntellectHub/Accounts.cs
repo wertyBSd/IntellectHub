@@ -52,6 +52,11 @@ internal sealed class AccountPool
     private readonly string _authPath;
     private readonly string _accountsDir;
 
+    /// <summary>Cooldown applied when DeepSeek gives no Retry-After to follow.</summary>
+    public long CooldownMs { get; set; } = DefaultCooldownMs;
+
+    public const long DefaultCooldownMs = 10 * 60 * 1000;
+
     public AccountPool(string root)
     {
         _authPath = Path.Combine(root, "deepseek-auth.json");
@@ -178,7 +183,20 @@ internal sealed class AccountPool
         }
     }
 
-    public const long DefaultCooldownMs = 10 * 60 * 1000;
+    /// <summary>Reports only real changes, so a steady-state reload stays silent.</summary>
+    internal void LogReload(AccountsFile file)
+    {
+        if (file.Added.Count == 0 && file.Removed.Count == 0 && file.Relogged.Count == 0) return;
+
+        var parts = new List<string>();
+        if (file.Added.Count > 0) parts.Add($"добавлен {file.Added.Count}");
+        if (file.Removed.Count > 0) parts.Add($"удалён {file.Removed.Count}");
+        if (file.Relogged.Count > 0) parts.Add($"вход обновлён {file.Relogged.Count}");
+
+        var message = $"аккаунты перечитаны: {string.Join(", ", parts)} · всего {file.List.Count}";
+        if (file.Relogged.Count > 0) AppLog.Ok(message);
+        else AppLog.Info(message);
+    }
 
     private static long Now() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
@@ -188,11 +206,28 @@ internal sealed class AccountPool
         lock (_gate) return (_accounts.Count(a => a.CanServe(now)), _accounts.Count);
     }
 
-    public void MarkRateLimited(Account account, long? retryAfterMs)
+    /// <summary>Milliseconds until the first sidelined login frees up, or 0.</summary>
+    public long NextCooldownMs()
     {
-        var ms = retryAfterMs is > 0 ? retryAfterMs.Value : DefaultCooldownMs;
+        var now = Now();
         lock (_gate)
         {
+            var next = _accounts
+                .Where(a => a.CooldownUntil > now)
+                .Select(a => a.CooldownUntil - now)
+                .DefaultIfEmpty(0)
+                .Min();
+            return next;
+        }
+    }
+
+    public void MarkRateLimited(Account account, long? retryAfterMs)
+    {
+        var ms = retryAfterMs is > 0 ? retryAfterMs.Value : CooldownMs;
+        lock (_gate)
+        {
+            // Never shorten a cooldown that is already running: a late in-flight
+            // response must not undo a penalty another request already paid.
             account.CooldownUntil = Math.Max(account.CooldownUntil, Now() + ms);
             account.CooldownReason = "rate_limit";
         }
@@ -202,7 +237,7 @@ internal sealed class AccountPool
     {
         lock (_gate)
         {
-            account.CooldownUntil = Math.Max(account.CooldownUntil, Now() + DefaultCooldownMs);
+            account.CooldownUntil = Math.Max(account.CooldownUntil, Now() + CooldownMs);
             account.CooldownReason = "auth";
         }
     }
@@ -211,8 +246,8 @@ internal sealed class AccountPool
     {
         lock (_gate)
         {
-            account.CooldownUntil = 0;
-            account.CooldownReason = null;
+            // The cooldown is deliberately left alone: a late reply from a request
+            // that started before the penalty must not erase that penalty.
             account.Failures = 0;
             account.LastSuccessAt = Now();
             account.LastUsedAt = Now();

@@ -69,8 +69,8 @@ public class UpstreamTests
     public void Sse_IgnoresNonDataLines()
     {
         var acc = new SseAccumulator();
-        Assert.False(acc.Consume("event: hint"));
-        Assert.False(acc.Consume(""));
+        acc.Consume("event: hint");
+        acc.Consume("");
         Assert.Equal("", acc.Content);
     }
 

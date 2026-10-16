@@ -20,6 +20,17 @@ internal static class Program
             if (e.ExceptionObject is Exception ex) AppLog.Error("Unhandled exception", ex);
         };
 
-        Application.Run(new MainForm());
+        try
+        {
+            Application.Run(new MainForm());
+        }
+        catch (Exception ex)
+        {
+            // A window that dies silently is worse than one that says why.
+            AppLog.Error("Не удалось запустить окно", ex);
+            MessageBox.Show(
+                $"Не удалось запустить окно:\n\n{ex.Message}\n\nПодробности в файле журнала.",
+                "IntellectHub", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
     }
 }

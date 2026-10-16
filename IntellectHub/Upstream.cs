@@ -13,10 +13,6 @@ internal sealed class DeepSeekChallenge
     public string? Signature { get; set; }
 }
 
-internal sealed record UpstreamChunk(string? Content, string? MessageId, string? FinishReason);
-
-internal sealed record SseDelta(string? Content, string? Reasoning, string? FinishReason, string? MessageId);
-
 internal interface IPowSolver
 {
     Task<long> SolveAsync(DeepSeekChallenge challenge, string wasmUrl, CancellationToken ct);
@@ -105,46 +101,72 @@ internal static class DeepSeekJson
     }
 }
 
+/// <summary>
+/// Accumulates DeepSeek's completion stream into the full reply. The reply is never
+/// emitted part-by-part: tool markup is only recognisable once the last token has
+/// arrived, so everything is buffered until the stream ends.
+/// </summary>
 internal sealed class SseAccumulator
 {
     private readonly List<Fragment> _fragments = new();
     private string _fullContent = "";
     private string _reasoning = "";
     private string _lastPath = "";
-    private int _emittedContent;
-    private int _emittedReasoning;
+    private string _eventName = "";
 
     public string? MessageId { get; private set; }
     public string? FinishReason { get; private set; }
-    public SseDelta? LastDelta { get; private set; }
     public string Content => _fullContent;
     public string ReasoningContent => _reasoning;
 
-    public bool Consume(string dataLine)
+    /// <summary>
+    /// Set when the stream carried a throttling signal. DeepSeek delivers these as
+    /// an <c>event: hint</c> frame on an otherwise-successful 200 stream, so the
+    /// reply looks complete while nothing was actually produced.
+    /// </summary>
+    public bool RateLimited { get; private set; }
+
+    public string? RateLimitDetail { get; private set; }
+
+    public void Consume(string line)
     {
-        LastDelta = null;
-        if (string.IsNullOrEmpty(dataLine) || !dataLine.StartsWith("data: ", StringComparison.Ordinal)) return false;
-        var json = dataLine[6..];
-        if (json.Length == 0) return false;
+        // A blank line closes an SSE frame, so the event name does not leak into
+        // the next one.
+        if (string.IsNullOrEmpty(line))
+        {
+            _eventName = "";
+            return;
+        }
+
+        // SSE frame headers select the meaning of the following data payload.
+        if (line.StartsWith("event:", StringComparison.Ordinal))
+        {
+            _eventName = line[6..].Trim();
+            return;
+        }
+
+        if (!line.StartsWith("data: ", StringComparison.Ordinal)) return;
+        var json = line[6..];
+        if (json.Length == 0) return;
 
         try
         {
             using var doc = JsonDocument.Parse(json);
             var root = doc.RootElement;
-            string? lineMessageId = null;
-            string? lineFinishReason = null;
 
             if (root.TryGetProperty("response_message_id", out var rid) && MessageId is null)
             {
                 var id = ScalarText(rid);
-                if (id is not null) { MessageId = id; lineMessageId = id; }
+                if (id is not null) MessageId = id;
             }
 
             if (root.TryGetProperty("finish_reason", out var fr))
             {
                 var reason = ScalarText(fr);
-                if (!string.IsNullOrEmpty(reason)) { FinishReason = reason; lineFinishReason = reason; }
+                if (!string.IsNullOrEmpty(reason)) FinishReason = reason;
             }
+
+            NoteThrottling(root);
 
             if (root.TryGetProperty("p", out var p) && p.ValueKind == JsonValueKind.String)
                 _lastPath = p.GetString() ?? "";
@@ -167,7 +189,7 @@ internal sealed class SseAccumulator
                 if (resp.TryGetProperty("finish_reason", out var rfr))
                 {
                     var reason = ScalarText(rfr);
-                    if (!string.IsNullOrEmpty(reason)) { FinishReason = reason; lineFinishReason = reason; }
+                    if (!string.IsNullOrEmpty(reason)) FinishReason = reason;
                 }
             }
 
@@ -197,39 +219,39 @@ internal sealed class SseAccumulator
                 else if (_lastPath == "response/finish_reason")
                 {
                     var reason = ScalarText(value);
-                    if (!string.IsNullOrEmpty(reason)) { FinishReason = reason; lineFinishReason = reason; }
+                    if (!string.IsNullOrEmpty(reason)) FinishReason = reason;
                 }
                 else if (_lastPath == "response/status")
                 {
                     var status = ScalarText(value);
-                    if (status is not null && status != "FINISHED") { FinishReason = status; lineFinishReason = status; }
+                    if (status is not null && status != "FINISHED") FinishReason = status;
                 }
             }
-
-            var deltaContent = TakeDelta(ref _emittedContent, _fullContent);
-            var deltaReasoning = TakeDelta(ref _emittedReasoning, _reasoning);
-
-            if (deltaContent is not null || deltaReasoning is not null || lineFinishReason is not null || lineMessageId is not null)
-                LastDelta = new SseDelta(deltaContent, deltaReasoning, lineFinishReason, lineMessageId);
-
-            return LastDelta is not null;
         }
         catch (Exception ex) when (ex is JsonException or InvalidOperationException or FormatException)
         {
-            return false;
+            // A malformed frame is skipped; the rest of the stream still counts.
         }
     }
 
-    private static string? TakeDelta(ref int emitted, string text)
+    /// <summary>
+    /// Records a throttling signal carried by the current frame, either as an
+    /// explicit finish reason or as localized text in the frame body.
+    /// </summary>
+    private void NoteThrottling(JsonElement root)
     {
-        if (text.Length > emitted)
+        if (RateLimited) return;
+        if (_eventName != "hint" && !RateLimit.IsFinishReason(FinishReason)) return;
+
+        var detail = root.TryGetProperty("content", out var content) && content.ValueKind == JsonValueKind.String
+            ? content.GetString()
+            : null;
+
+        if (RateLimit.IsFinishReason(FinishReason) || RateLimit.IsSignal(detail))
         {
-            var delta = text[emitted..];
-            emitted = text.Length;
-            return delta;
+            RateLimited = true;
+            RateLimitDetail = string.IsNullOrWhiteSpace(detail) ? FinishReason : detail;
         }
-        emitted = text.Length;
-        return null;
     }
 
     private void AppendFragments(JsonElement value)

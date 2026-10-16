@@ -13,13 +13,14 @@ internal sealed class ProxyServer
 
     public bool IsRunning => _listener?.IsListening == true;
     public ApiKeyStore ApiKeys => _services.ApiKeys;
+    public AccountPool Pool => _services.Pool;
 
     public ProxyServer(AppConfig config)
     {
-        _config = config;
-        _services = new AppServices(config);
+        _config = config.Normalize();
+        _services = new AppServices(_config);
         _router = RequestRouter.CreateDefault(
-            new ChatCompletionService(_services.Pool, _services.Client),
+            new ChatCompletionService(_services.Pool, _services.Client, _config),
             _services.Pool,
             _services.ApiKeys);
     }

@@ -4,6 +4,25 @@ using System.Text.Json;
 
 namespace IntellectHub;
 
+internal static class RequestContext
+{
+    /// <summary>
+    /// Identity of the conversation behind a request. Clients that send
+    /// x-agent-session keep one remote DeepSeek chat for the whole conversation
+    /// instead of paying for a new session on every turn.
+    /// </summary>
+    public static string? SessionKey(HttpListenerContext context)
+    {
+        var header = context.Request.Headers["x-agent-session"];
+        if (header is not { Length: > 0 }) return null;
+
+        var value = header.Trim();
+        if (value.Length > 200) value = value[..200];
+
+        return string.IsNullOrEmpty(value) ? null : value;
+    }
+}
+
 internal sealed class ChatCompletionsHandler : IRequestHandler
 {
     private readonly ChatCompletionService _service;
@@ -34,100 +53,123 @@ internal sealed class ChatCompletionsHandler : IRequestHandler
             return;
         }
 
-        if (request.Stream)
-        {
-            await StreamAsync(context, request, ct);
-            return;
-        }
+        request.SessionKey = RequestContext.SessionKey(context);
 
+        // The upstream reply is always buffered: tool markup is only recognisable once
+        // the reply is complete, so streaming it out would emit raw DSML mid-token.
+        CompletionResult result;
         try
         {
-            var result = await _service.CompleteAsync(request, ct);
-            var id = "chatcmpl-" + (result.MessageId ?? Guid.NewGuid().ToString("N"));
-            var created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            var modelId = ModelRegistry.Canonicalize(request.Model);
-
-            var payload = JsonSerializer.Serialize(new
-            {
-                id,
-                @object = "chat.completion",
-                created,
-                model = modelId,
-                choices = new[]
-                {
-                    new
-                    {
-                        index = 0,
-                        message = new { role = "assistant", content = result.Content },
-                        finish_reason = NormalizeFinishReason(result.FinishReason),
-                    },
-                },
-                usage = new { prompt_tokens = 0, completion_tokens = 0, total_tokens = 0 },
-            });
-
-            await HttpResponses.WriteJsonAsync(context, 200, payload);
+            result = await _service.CompleteAsync(request, ct);
         }
         catch (UpstreamException ex)
         {
-            await HttpResponses.WriteErrorAsync(context, ex.StatusCode, ex.Message, ErrorType(ex.StatusCode));
+            await HttpResponses.WriteErrorAsync(context, ex.StatusCode, ex.Message, ErrorType(ex));
+            return;
         }
+
+        var ids = ToolCallIds(result);
+
+        if (request.Stream)
+        {
+            await StreamAsync(context, request, result, ids, ct);
+            return;
+        }
+
+        var payload = BuildCompletionPayload(
+            "chatcmpl-" + (result.MessageId ?? Guid.NewGuid().ToString("N")),
+            ModelRegistry.Canonicalize(request.Model),
+            result,
+            ids);
+
+        await HttpResponses.WriteJsonAsync(context, 200, payload);
     }
 
-    private async Task StreamAsync(HttpListenerContext context, ChatCompletionRequest request, CancellationToken ct)
+    /// <summary>
+    /// The chat.completion body. A tool call carries <c>content: null</c> and
+    /// <c>finish_reason: "tool_calls"</c>, so the markup never rides along as text.
+    /// </summary>
+    internal static string BuildCompletionPayload(string id, string modelId, CompletionResult result,
+        IReadOnlyList<string> ids) =>
+        JsonSerializer.Serialize(new
+        {
+            id,
+            @object = "chat.completion",
+            created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+            model = modelId,
+            choices = new[]
+            {
+                new
+                {
+                    index = 0,
+                    message = new
+                    {
+                        role = "assistant",
+                        content = result.HasToolCalls ? null : result.Content,
+                        tool_calls = result.HasToolCalls
+                            ? result.ToolCalls.Select((call, index) => new
+                            {
+                                id = ids[index],
+                                type = "function",
+                                @function = new { name = call.Name, arguments = call.Arguments },
+                            }).ToArray()
+                            : null,
+                    },
+                    finish_reason = result.HasToolCalls
+                        ? "tool_calls"
+                        : NormalizeFinishReason(result.FinishReason),
+                },
+            },
+            usage = new { prompt_tokens = 0, completion_tokens = 0, total_tokens = 0 },
+        });
+
+    private async Task StreamAsync(HttpListenerContext context, ChatCompletionRequest request,
+        CompletionResult result, IReadOnlyList<string> ids, CancellationToken ct)
     {
         var response = context.Response;
-        var id = "chatcmpl-" + Guid.NewGuid().ToString("N");
+        var id = "chatcmpl-" + (result.MessageId ?? Guid.NewGuid().ToString("N"));
         var created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         var modelId = ModelRegistry.Canonicalize(request.Model);
 
-        var started = false;
-        var finishReason = "stop";
+        HttpResponses.StartEventStream(response);
+        await WriteChunkAsync(response, id, created, modelId, new { role = "assistant" }, null, ct);
 
-        async Task EmitAsync(SseDelta delta)
+        if (result.HasToolCalls)
         {
-            if (!started)
+            // OpenAI streams the identity of each call first, then its arguments.
+            await WriteChunkAsync(response, id, created, modelId, new
             {
-                HttpResponses.StartEventStream(response);
-                await WriteChunkAsync(response, id, created, modelId, new { role = "assistant" }, null, ct);
-                started = true;
-            }
+                tool_calls = result.ToolCalls.Select((call, index) => new
+                {
+                    index,
+                    id = ids[index],
+                    type = "function",
+                    @function = new { name = call.Name, arguments = "" },
+                }).ToArray(),
+            }, null, ct);
 
-            if (!string.IsNullOrEmpty(delta.Content))
-                await WriteChunkAsync(response, id, created, modelId, new { content = delta.Content }, null, ct);
-
-            if (delta.FinishReason is { } fr)
-                finishReason = NormalizeFinishReason(fr);
-        }
-
-        try
-        {
-            await _service.StreamAsync(request, EmitAsync, ct);
-        }
-        catch (UpstreamException ex)
-        {
-            if (!started)
+            await WriteChunkAsync(response, id, created, modelId, new
             {
-                await HttpResponses.WriteErrorAsync(context, ex.StatusCode, ex.Message, ErrorType(ex.StatusCode));
-                return;
-            }
-
-            var error = JsonSerializer.Serialize(new { error = new { message = ex.Message, type = ErrorType(ex.StatusCode) } });
-            await HttpResponses.WriteSseDataAsync(response, error, ct);
-            await HttpResponses.WriteSseDataAsync(response, "[DONE]", ct);
-            response.Close();
-            return;
+                tool_calls = result.ToolCalls.Select((call, index) => new
+                {
+                    index,
+                    @function = new { arguments = call.Arguments },
+                }).ToArray(),
+            }, null, ct);
         }
-
-        if (!started)
+        else if (result.Content.Length > 0)
         {
-            HttpResponses.StartEventStream(response);
-            await WriteChunkAsync(response, id, created, modelId, new { role = "assistant" }, null, ct);
+            await WriteChunkAsync(response, id, created, modelId, new { content = result.Content }, null, ct);
         }
 
-        await WriteChunkAsync(response, id, created, modelId, new { }, finishReason, ct);
+        await WriteChunkAsync(response, id, created, modelId, new { },
+            result.HasToolCalls ? "tool_calls" : NormalizeFinishReason(result.FinishReason), ct);
         await HttpResponses.WriteSseDataAsync(response, "[DONE]", ct);
         response.Close();
     }
+
+    private static IReadOnlyList<string> ToolCallIds(CompletionResult result) =>
+        result.ToolCalls.Select(_ => "call_" + Guid.NewGuid().ToString("N")[..24]).ToList();
 
     private static Task WriteChunkAsync(HttpListenerResponse response, string id, long created, string modelId,
         object delta, string? finishReason, CancellationToken ct)
@@ -143,17 +185,25 @@ internal sealed class ChatCompletionsHandler : IRequestHandler
         return HttpResponses.WriteSseDataAsync(response, payload, ct);
     }
 
-    private static string ErrorType(int status) => status switch
+    internal static string ErrorType(UpstreamException ex)
     {
-        401 or 403 => "authentication_error",
-        429 => "rate_limit_error",
-        503 => "service_unavailable",
-        _ => "upstream_error",
-    };
+        // A specific cause always wins over the generic status-derived name.
+        if (ex.ErrorKind is { Length: > 0 } kind) return kind;
+        if (ex is MalformedToolCallException) return MalformedToolCallException.ErrorTypeName;
+
+        return ex.StatusCode switch
+        {
+            401 or 403 => "authentication_error",
+            429 => "rate_limit_error",
+            503 => "service_unavailable",
+            504 => "request_timeout",
+            _ => "upstream_error",
+        };
+    }
 
     private static string NormalizeFinishReason(string? reason) => reason switch
     {
-        "stop" or null => "stop",
+        null or "" or "stop" => "stop",
         "length" => "length",
         _ => reason,
     };
