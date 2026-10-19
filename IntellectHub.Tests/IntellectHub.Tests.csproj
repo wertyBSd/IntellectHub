@@ -15,6 +15,9 @@
 
   <ItemGroup>
     <ProjectReference Include="..\IntellectHub\IntellectHub.csproj" />
+    <!-- The client owns the input grammar and the settings validators. Both decide
+         what the user is allowed to type, so both belong under test. -->
+    <ProjectReference Include="..\IntellectHub.Client\IntellectHub.Client.csproj" />
   </ItemGroup>
 
 </Project>

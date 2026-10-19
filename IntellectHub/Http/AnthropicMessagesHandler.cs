@@ -17,14 +17,15 @@ internal sealed class AnthropicMessagesHandler : IRequestHandler
     public async Task HandleAsync(HttpListenerContext context, CancellationToken ct)
     {
         AnthropicRequest? request;
+        string rawBody;
         try
         {
-            using var reader = new StreamReader(context.Request.InputStream, Encoding.UTF8);
-            var body = await reader.ReadToEndAsync(ct);
-            request = JsonSerializer.Deserialize<AnthropicRequest>(body);
+            rawBody = await RequestTrace.ReadAsync(context, ct);
+            request = JsonSerializer.Deserialize<AnthropicRequest>(rawBody);
         }
         catch (JsonException ex)
         {
+            Wire.Write("body.in.err", "invalid JSON: {0}", ex.Message);
             await HttpResponses.WriteErrorAsync(context, 400, $"Invalid JSON body: {ex.Message}", "invalid_request_error");
             return;
         }
@@ -35,18 +36,27 @@ internal sealed class AnthropicMessagesHandler : IRequestHandler
             return;
         }
 
+        Wire.Write("body.in.sum", "model={0} · stream={1} · max_tokens={2} · messages={3} · tools={4}",
+            request.Model ?? "(none)", request.Stream, request.MaxTokens,
+            request.Messages?.Count ?? 0, request.Tools?.Count ?? 0);
+
         CompletionResult result;
         try
         {
             var chatRequest = ToCompletionRequest(request);
             chatRequest.SessionKey = RequestContext.SessionKey(context);
+            Wire.Write("body.in.norm", "session_key={0} · messages={1} · tools={2}",
+                chatRequest.SessionKey ?? "(new session)", chatRequest.Messages.Count, chatRequest.Tools?.Count ?? 0);
             result = await _service.CompleteAsync(chatRequest, ct);
         }
         catch (UpstreamException ex)
         {
+            Wire.Write("body.in.upstream", "{0} ({1}): {2}", ex.StatusCode, ex.ErrorKind ?? "upstream", ex.Message);
             await HttpResponses.WriteUpstreamErrorAsync(context, ex);
             return;
         }
+
+        RequestTrace.Summarize("body.out.sum", result);
 
         // Anthropic carries tool calls as tool_use blocks inside the content array.
         var content = new List<object>();

@@ -19,12 +19,12 @@ internal sealed class ResponsesHandler : IRequestHandler
         ResponsesRequest? request;
         try
         {
-            using var reader = new StreamReader(context.Request.InputStream, Encoding.UTF8);
-            var body = await reader.ReadToEndAsync(ct);
+            var body = await RequestTrace.ReadAsync(context, ct);
             request = JsonSerializer.Deserialize<ResponsesRequest>(body);
         }
         catch (JsonException ex)
         {
+            Wire.Write("body.in.err", "invalid JSON: {0}", ex.Message);
             await HttpResponses.WriteErrorAsync(context, 400, $"Invalid JSON body: {ex.Message}", "invalid_request_error");
             return;
         }
@@ -35,6 +35,9 @@ internal sealed class ResponsesHandler : IRequestHandler
             return;
         }
 
+        Wire.Write("body.in.sum", "model={0} · stream={1} · tools={2}",
+            request.Model ?? "(none)", request.Stream, request.Tools?.Count ?? 0);
+
         CompletionResult result;
         try
         {
@@ -44,9 +47,12 @@ internal sealed class ResponsesHandler : IRequestHandler
         }
         catch (UpstreamException ex)
         {
+            Wire.Write("body.in.upstream", "{0} ({1}): {2}", ex.StatusCode, ex.ErrorKind ?? "upstream", ex.Message);
             await HttpResponses.WriteUpstreamErrorAsync(context, ex);
             return;
         }
+
+        RequestTrace.Summarize("body.out.sum", result);
 
         var id = "resp_" + (result.MessageId ?? Guid.NewGuid().ToString("N"));
         var modelId = ModelRegistry.Canonicalize(request.Model);

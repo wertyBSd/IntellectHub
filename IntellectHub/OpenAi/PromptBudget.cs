@@ -27,14 +27,28 @@ internal static class PromptBudget
         {
             // Even the reserved parts alone overflow. Trim the oldest history
             // rather than the manifest, and let the caller's cap handle the rest.
+            Wire.Write("budget", "OVERFLOW: reserved head is {0} chars against a {1} budget · conversation dropped entirely",
+                head.Length, budget);
             return TruncateMiddle(head, budget);
         }
 
+        var truncated = conversation.Length > room;
         var body = conversation.Length <= room ? conversation : TruncateMiddle(conversation, room);
 
         if (systemPrompt is { Length: > 0 }) head = Join([systemPrompt, head]);
 
-        return body.Length > 0 ? Join([head, body]) : head;
+        var result = body.Length > 0 ? Join([head, body]) : head;
+
+        Wire.Write("budget", "system={0} · reserved={1} · conversation={2} → {3} chars · budget={4} · {5}",
+            systemPrompt?.Length ?? 0,
+            reservedCost,
+            conversation.Length,
+            result.Length,
+            budget,
+            truncated
+                ? $"COMPACTED, dropped ~{conversation.Length - room} chars from the middle"
+                : "fits, nothing dropped");
+        return result;
     }
 
     public static string Join(IReadOnlyList<string?> parts)

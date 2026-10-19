@@ -38,20 +38,31 @@ internal sealed class RequestRouter
         var method = context.Request.HttpMethod;
         var path = context.Request.Url?.AbsolutePath ?? "/";
         var handler = Resolve(method, path);
+        Wire.Write("route", "→ {0} {1} · auth={2}", method, path, handler.RequiresAuth ? "required" : "open");
 
         if (handler.RequiresAuth && _keys.HasKeys)
         {
             var raw = ApiKeyStore.ExtractKey(context.Request);
             var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             var status = _keys.Validate(raw, now, out var record);
+            Wire.Write("auth", "presented {0} · verdict={1}{2}",
+                Wire.Mask(raw), status,
+                record is null ? "" : $" · key={record.Prefix}");
             if (status != KeyStatus.Ok)
             {
                 var (code, message) = Describe(status);
+                Wire.Write("auth.deny", $"{code} {message}");
                 await HttpResponses.WriteErrorAsync(context, code, message, "authentication_error");
                 return;
             }
 
             _keys.RecordUse(record!, now);
+        }
+        else if (handler.RequiresAuth)
+        {
+            // No keys provisioned at all: the gateway is open, which is the default
+            // install state and worth seeing explicitly in a trace.
+            Wire.Write("auth", "no keys configured · request allowed without a credential");
         }
 
         await handler.HandleAsync(context, ct);

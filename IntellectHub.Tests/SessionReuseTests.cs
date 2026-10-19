@@ -114,6 +114,34 @@ public sealed class SessionReuseTests
     }
 
     [Fact]
+    public async Task TheAgentToolLoopStaysOnOneRemoteChat()
+    {
+        using var temp = new TempAccountPool(("main", 0));
+        var upstream = new SessionRecordingUpstream();
+        var service = new ChatCompletionService(temp.Pool, upstream, Config());
+
+        // Turn 1: the user asks, the model asks for a tool.
+        await service.CompleteAsync(Turn("agent-1", Msg("user", "прочитай README")), CancellationToken.None);
+
+        // The client then appends the tool call and its result before asking again,
+        // which is what the console client does between the agent's tool steps.
+        // Without a session header this shape opened a new remote chat on every one
+        // of up to 16 steps, paying a session-create round trip for each.
+        await service.CompleteAsync(Turn("agent-1",
+            Msg("user", "прочитай README"),
+            Msg("assistant", "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>read"),
+            Msg("user", "содержимое README")), CancellationToken.None);
+
+        Assert.Equal(2, upstream.SessionIds.Count);
+        Assert.NotEqual("", upstream.SessionIds[1]);
+        Assert.Equal("msg-1", upstream.Parents[1]);
+
+        // Only the tool result crosses: the earlier turns are already in the chat.
+        Assert.DoesNotContain("прочитай README", upstream.Prompts[1]);
+        Assert.Contains("содержимое README", upstream.Prompts[1]);
+    }
+
+    [Fact]
     public async Task TwoAgentsDoNotShareASession()
     {
         using var temp = new TempAccountPool(("main", 0));

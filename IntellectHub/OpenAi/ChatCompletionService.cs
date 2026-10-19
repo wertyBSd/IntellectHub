@@ -220,10 +220,18 @@ internal sealed class ChatCompletionService
         }
 
         var dsmlCalls = ToolCallParser.ListDsmlToolCalls(content);
-        var nativeOnlyDsml = dsmlCalls.Count > 0 &&
-                            dsmlCalls.All(call => ToolCallParser.IsDeepSeekNativeTool(call.Name));
 
-        var shouldRepairNative = selected is null && (ignoredNative is not null || nativeOnlyDsml);
+        // A call to one of DeepSeek's own tools can arrive in either envelope, so
+        // the search for one cannot look at DSML alone. It did once: a JSON call to
+        // web_search was filed as unparseable markup and answered with the generic
+        // repair, which never says the tool is unreachable — so the model asked for
+        // it again and the turn ended in a 502.
+        var mentioned = ToolCallParser.MentionedToolNames(content);
+        var nativeName = ignoredNative
+                         ?? mentioned.FirstOrDefault(name => ToolCallParser.IsDeepSeekNativeTool(name))
+                         ?? NativeToolName(dsmlCalls);
+
+        var shouldRepairNative = selected is null && nativeName is not null;
         var shouldRepairMarkup = selected is null && !shouldRepairNative &&
                                  ToolCallParser.LooksLikeToolCallMarkup(content);
         var shouldRepairCodeDump = allowed.Count > 0 && selected is null && !shouldRepairMarkup &&
@@ -233,14 +241,25 @@ internal sealed class ChatCompletionService
         if (shouldRepairNative || shouldRepairMarkup || shouldRepairCodeDump)
         {
             var retryPrompt = shouldRepairNative
-                ? ToolPrompts.NativeToolRepairPrompt(prepared.Model.SearchEnabled, ignoredNative ?? NativeToolName(dsmlCalls))
+                ? ToolPrompts.NativeToolRepairPrompt(prepared.Model.SearchEnabled, nativeName)
                 : shouldRepairMarkup
                     ? ToolPrompts.MalformedMarkupRepairPrompt
                     : ToolPrompts.CodeDumpRepairPrompt;
 
+            var why = shouldRepairNative
+                ? $"model called DeepSeek's own tool '{nativeName}'"
+                : shouldRepairMarkup
+                    ? "markup present but unparseable"
+                    : "model dumped code instead of calling a tool";
+
+            Wire.Write("resolve.repair", "{0} · allowed=[{1}] · native={2} · mentioned=[{3}]",
+                why, string.Join(", ", allowed), nativeName ?? "-", string.Join(", ", mentioned));
+            Wire.Block("resolve.repair.src", content);
+
             return new Resolution(null, retryPrompt);
         }
 
+        Wire.Write("resolve.text", "no tool call · {0} chars delivered as answer", upstream.Content.Length);
         return new Resolution(ToResult(prepared, upstream, upstream.FinishReason, []), null);
     }
 
@@ -306,7 +325,27 @@ internal sealed class ChatCompletionService
 
         // Still unusable after one repair: fail loudly rather than pass markup on.
         AppLog.Warn($"{trace} повтор не помог — разметка вызова инструмента осталась неиспользуемой");
-        throw Unusable();
+        throw Unusable(retry.Content, prepared);
+    }
+
+    /// <summary>
+    /// The failure the client sees. Names the tool the model reached for when the
+    /// reply contained a well-formed call to something nobody offered: "malformed
+    /// markup" tells the user nothing they can act on, while "it asked for
+    /// discard_everything" tells them exactly what the gateway has to learn.
+    /// </summary>
+    private static MalformedToolCallException Unusable(string? replyContent, Prepared prepared)
+    {
+        var requested = ToolCallParser.MentionedToolNames(replyContent);
+        var unknown = requested.Where(name => !prepared.AllowedNames.Contains(name)).ToList();
+
+        if (unknown.Count == 0)
+            return new MalformedToolCallException(
+                "DeepSeek returned malformed or native-only tool-call markup after one repair attempt");
+
+        return new MalformedToolCallException(
+            $"DeepSeek called {string.Join(", ", unknown)}, which this client does not offer " +
+            $"(available: {(prepared.AllowedNames.Count == 0 ? "none" : string.Join(", ", prepared.AllowedNames))})");
     }
 
     private static MalformedToolCallException Unusable(string? detail = null) =>
@@ -314,6 +353,20 @@ internal sealed class ChatCompletionService
             ? "DeepSeek returned malformed or native-only tool-call markup after one repair attempt"
             : "DeepSeek returned malformed or native-only tool-call markup after one repair attempt " +
               $"(the repair retry failed: {detail})");
+
+    /// <summary>
+    /// True when the failure is about the remote chat rather than the login or the
+    /// request: a session DeepSeek will not continue, or a body it refuses to
+    /// deserialize because a stored parent id is not the shape it expects.
+    /// </summary>
+    private static bool IsStaleSession(UpstreamException ex)
+    {
+        if (ex.StatusCode is 400 or 404 or 422) return true;
+
+        return ex.StatusCode == 500 &&
+               (ex.Message.Contains("deserialize", StringComparison.OrdinalIgnoreCase) ||
+                ex.Message.Contains("parent_message_id", StringComparison.OrdinalIgnoreCase));
+    }
 
     private static string? NativeToolName(IReadOnlyList<ParsedToolCall> dsmlCalls)
     {
@@ -341,9 +394,15 @@ internal sealed class ChatCompletionService
     ///
     /// The prompt is rebuilt at send time rather than passed in, because a live
     /// remote session changes which part of the conversation is even relevant.
+    ///
+    /// <paramref name="remember"/> decides whether this exchange becomes the
+    /// conversation's remote chat. A continuation round must not: its reply is a
+    /// fragment stitched onto a cut-off answer, and re-pointing the session at the
+    /// throwaway chat it was produced in leaves the next turn talking to a chat
+    /// that was built for a different job.
     /// </summary>
     private async Task<UpstreamResult> AskAsync(Prepared prepared, ChatCompletionRequest? request, int budget,
-        string? explicitPrompt, Trace trace, CancellationToken ct)
+        string? explicitPrompt, Trace trace, CancellationToken ct, bool remember = true)
     {
         var maxHops = Math.Max(1, _pool.All.Count + 1);
         SessionState? session = null;
@@ -380,6 +439,10 @@ internal sealed class ChatCompletionService
 
             AppLog.Info($"{trace} аккаунт {account.Id} · отправка в DeepSeek ({prompt.Length} симв." +
                         (session is null ? ")" : $") · сессия {Shorten(session.ChatSessionId)}, только новые ходы"));
+            Wire.Write("ask", "hop={0} · account={1} · prompt={2} chars · start_index={3} · budget={4} · session={5}",
+                hop, account.Id, prompt.Length, startIndex, budget,
+                session is null ? "(fresh)" : $"{Shorten(session.ChatSessionId)}/{Shorten(session.ParentMessageId)}");
+
             var hopClock = System.Diagnostics.Stopwatch.StartNew();
             try
             {
@@ -387,8 +450,10 @@ internal sealed class ChatCompletionService
                     session?.ChatSessionId, session?.ParentMessageId, ct);
 
                 _pool.MarkSuccess(account);
-                RememberSession(prepared, request, account, result, session);
+                if (remember) RememberSession(prepared, request, account, result, session);
                 AppLog.Ok($"{trace} ответ · {result.Content.Length} симв. · finish={result.FinishReason ?? "stop"} · {hopClock.ElapsedMilliseconds} мс");
+                Wire.Timing("ask.ok", hopClock, "account={0} · session={1} · message_id={2}",
+                    account.Id, result.ChatSessionId ?? "(none)", result.MessageId ?? "-");
                 return result;
             }
             catch (UpstreamRateLimitException ex)
@@ -400,15 +465,44 @@ internal sealed class ChatCompletionService
 
                 var pauseSec = Math.Max(1, (int)(_pool.NextCooldownMs() / 1000));
                 AppLog.Warn($"{trace} троттлинг · аккаунт {account.Id} на паузе {pauseSec}с · {ex.Message}");
+                Wire.Write("ask.throttle", "account={0} sidelined for {1}s · rotating to hop {2} · {3}",
+                    account.Id, pauseSec, hop + 1, ex.Message);
 
                 // Rotate. Once every login is sidelined the next AcquireAsync raises
                 // a pool-level 429 carrying the real Retry-After, which is a far more
                 // useful thing to hand the client than the last login's raw error.
                 continue;
             }
+            catch (UpstreamException ex) when (session is not null && IsStaleSession(ex))
+            {
+                // The remote chat no longer accepts this conversation — expired, or a
+                // parent id DeepSeek will not take. The account is fine and rotating
+                // would only burn another login, so the same hop is retried against a
+                // freshly opened session carrying the whole transcript.
+                _pool.MarkSuccess(account);
+                account.LastError = ex.Message;
+                _sessions.Reset(session.AgentId);
+
+                AppLog.Warn($"{trace} сессия {Shorten(session.ChatSessionId)} не принимается ({ex.StatusCode}) · начинаем новую");
+                Wire.Write("ask.session_stale", "{0} · retrying hop {1} on a fresh session with the full transcript",
+                    ex.Message, hop);
+
+                var freshClock = System.Diagnostics.Stopwatch.StartNew();
+                var retry = await _client.CompleteAsync(account, prepared.Model,
+                    explicitPrompt ?? BuildPrompt(request, prepared, 0, budget),
+                    null, null, ct);
+
+                _pool.MarkSuccess(account);
+                RememberSession(prepared, request, account, retry, null);
+                AppLog.Ok($"{trace} ответ · {retry.Content.Length} симв. · finish={retry.FinishReason ?? "stop"} · {freshClock.ElapsedMilliseconds} мс");
+                Wire.Timing("ask.ok.retry", freshClock, "account={0} · new session={1} · message_id={2}",
+                    account.Id, retry.ChatSessionId ?? "(none)", retry.MessageId ?? "-");
+                return retry;
+            }
             catch (Exception ex)
             {
                 Fail(account, ex);
+                Wire.Write("ask.fail", "account={0} · {1}: {2}", account.Id, ex.GetType().Name, ex.Message);
                 throw;
             }
             finally
@@ -450,10 +544,18 @@ internal sealed class ChatCompletionService
         Account account, Trace trace)
     {
         var key = request.SessionKey;
-        if (string.IsNullOrEmpty(key)) return (null, 0);
+        if (string.IsNullOrEmpty(key))
+        {
+            Wire.Write("session.reset", "client sent no x-agent-session header · a new remote chat will be created");
+            return (null, 0);
+        }
 
         var state = _sessions.Get(key);
-        if (state is null) return (null, 0);
+        if (state is null)
+        {
+            Wire.Write("session.reset", "key {0} is unknown · new remote chat", Shorten(key));
+            return (null, 0);
+        }
 
         var systemFingerprint = SystemFingerprintOf(prepared);
 
@@ -461,6 +563,8 @@ internal sealed class ChatCompletionService
         {
             _sessions.Reset(key);
             AppLog.Muted($"{trace} сессия привязана к другому аккаунту · начинаем заново");
+            Wire.Write("session.reset", "key {0} belongs to account {1}, this turn runs on {2} · new remote chat",
+                Shorten(key), state.AccountId, account.Id);
             return (null, 0);
         }
 
@@ -468,6 +572,7 @@ internal sealed class ChatCompletionService
         {
             _sessions.Reset(key);
             AppLog.Info($"{trace} инструкции или набор инструментов изменились · начинаем заново");
+            Wire.Write("session.reset", "key {0}: system prompt or tool set changed · new remote chat", Shorten(key));
             return (null, 0);
         }
 
@@ -475,6 +580,8 @@ internal sealed class ChatCompletionService
         if (state.SentMessages <= 0 || state.SentMessages >= messages.Count)
         {
             _sessions.Reset(key);
+            Wire.Write("session.reset", "key {0}: nothing new to forward (sent={1}, client has {2}) · new remote chat",
+                Shorten(key), state.SentMessages, messages.Count);
             return (null, 0);
         }
 
@@ -487,6 +594,8 @@ internal sealed class ChatCompletionService
         {
             _sessions.Reset(key);
             AppLog.Info($"{trace} история изменилась · начинаем заново");
+            Wire.Write("session.reset", "key {0}: message {1} no longer matches what was forwarded · new remote chat",
+                Shorten(key), state.SentMessages - 1);
             return (null, 0);
         }
 
@@ -500,9 +609,12 @@ internal sealed class ChatCompletionService
             // Nothing new to say. A remote session cannot answer an empty turn, and
             // guessing would risk re-running an old request.
             _sessions.Reset(key);
+            Wire.Write("session.reset", "key {0}: only assistant turns remain, nothing to send · new remote chat", Shorten(key));
             return (null, 0);
         }
 
+        Wire.Write("session.reuse", "key {0} · continuing chat {1} · resuming at message {2} of {3}",
+            Shorten(key), Shorten(state.ChatSessionId), start, messages.Count);
         return (state, start);
     }
 
@@ -739,7 +851,7 @@ internal sealed class ChatCompletionService
             UpstreamResult next;
             try
             {
-                next = await AskAsync(prepared, request, 0, ContinuationPrompt(content), trace, ct);
+                next = await AskAsync(prepared, request, 0, ContinuationPrompt(content), trace, ct, remember: false);
             }
             catch (UpstreamRateLimitException ex)
             {

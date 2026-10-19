@@ -284,11 +284,38 @@ public sealed class ToolRegistry
         return new ToolResult(output.ToString(), IsError: process.ExitCode != 0);
     }
 
+    /// <summary>
+    /// Maps a tool-supplied path onto the workspace.
+    ///
+    /// A leading slash means "the workspace root", not the drive root. Models write
+    /// <c>/index.html</c> the way they would write a URL, and Path.Combine treats a
+    /// leading separator as "discard everything before it", which sent the write to
+    /// <c>C:\index.html</c> and then refused it for escaping the workspace.
+    ///
+    /// A genuinely absolute path outside the workspace is still refused.
+    /// </summary>
     private string Resolve(string path)
     {
-        var full = Path.GetFullPath(Path.Combine(_workspace, path));
-        if (!full.StartsWith(_workspace, StringComparison.OrdinalIgnoreCase))
+        if (string.IsNullOrWhiteSpace(path))
+            throw new InvalidOperationException("path is empty");
+
+        var relative = path.Replace('/', Path.DirectorySeparatorChar)
+            .TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+        if (relative.Length == 0)
+            throw new InvalidOperationException("path names no file");
+
+        var full = Path.GetFullPath(Path.Combine(_workspace, relative));
+
+        // Compared against the root plus a separator, so a sibling directory whose
+        // name merely starts with the workspace name is not mistaken for one inside.
+        var root = _workspace.EndsWith(Path.DirectorySeparatorChar)
+            ? _workspace
+            : _workspace + Path.DirectorySeparatorChar;
+
+        if (!full.StartsWith(root, StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException($"Path escapes workspace: {path}");
+
         return full;
     }
 

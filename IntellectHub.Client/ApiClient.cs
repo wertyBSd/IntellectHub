@@ -53,36 +53,73 @@ public sealed class ApiClient : IDisposable
             _http.DefaultRequestHeaders.TryAddWithoutValidation("Authorization", "Bearer " + config.ApiKey);
             _http.DefaultRequestHeaders.TryAddWithoutValidation("x-api-key", config.ApiKey);
         }
+
+        Wire.TraceId = null;
+        Wire.Write("client.init", "base_url={0} · model={1} · max_tokens={2} · temperature={3} · api_key={4} · timeout=300s",
+            config.BaseUrl.TrimEnd('/') + "/",
+            config.Model,
+            config.MaxTokens,
+            config.Temperature,
+            string.IsNullOrWhiteSpace(config.ApiKey) ? "(none)" : Wire.Mask(config.ApiKey));
+        Wire.Write("client.init", "trace file → {0}", Wire.LogDirectory);
     }
 
     public async Task<string> HealthAsync(CancellationToken ct = default)
     {
+        var id = Wire.NewTraceId();
+        Wire.TraceId = id;
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        Wire.Write("http.req", "GET health → {0}", _http.BaseAddress);
+
         using var response = await _http.GetAsync("health", ct);
+        var body = await response.Content.ReadAsStringAsync(ct);
+        Wire.Timing("http.resp", clock, "{0} · {1} bytes", (int)response.StatusCode, body.Length);
+        Wire.Json("http.body", body);
+
         response.EnsureSuccessStatusCode();
-        return await response.Content.ReadAsStringAsync(ct);
+        return body;
     }
 
     public async Task<IReadOnlyList<string>> ListModelsAsync(CancellationToken ct = default)
     {
+        var id = Wire.NewTraceId();
+        Wire.TraceId = id;
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        Wire.Write("http.req", "GET v1/models → {0}", _http.BaseAddress);
+
         using var response = await _http.GetAsync("v1/models", ct);
-        response.EnsureSuccessStatusCode();
         var json = await response.Content.ReadAsStringAsync(ct);
+        Wire.Timing("http.resp", clock, "{0} · {1} bytes", (int)response.StatusCode, json.Length);
+
+        response.EnsureSuccessStatusCode();
         var list = new List<string>();
         using var doc = JsonDocument.Parse(json);
         if (doc.RootElement.TryGetProperty("data", out var data) && data.ValueKind == JsonValueKind.Array)
         {
             foreach (var item in data.EnumerateArray())
-                if (item.TryGetProperty("id", out var id) && id.GetString() is { } s)
+                if (item.TryGetProperty("id", out var id2) && id2.GetString() is { } s)
                     list.Add(s);
         }
+        Wire.Write("http.body", "models=[{0}]", string.Join(", ", list));
         return list;
     }
 
+    /// <summary>
+    /// One agent turn, client to gateway and back. <paramref name="traceId"/> is
+    /// minted by the caller so the CLI's tool execution can be labelled with the
+    /// same id the gateway and DeepSeek lines carry. <paramref name="sessionKey"/>
+    /// is the conversation's identity: the gateway uses it to keep one remote
+    /// DeepSeek chat open across the turns instead of creating one per request.
+    /// </summary>
     public async Task<AssistantReply> SendAsync(
         IReadOnlyList<ChatMessage> messages,
         IReadOnlyList<ToolSpec>? tools,
+        string traceId,
+        string sessionKey,
         CancellationToken ct = default)
     {
+        Wire.TraceId = traceId;
+
         var payload = new JsonObject
         {
             ["model"] = _config.Model,
@@ -117,16 +154,44 @@ public sealed class ApiClient : IDisposable
             payload["tools"] = toolArray;
         }
 
-        using var response = await _http.PostAsync(
-            "v1/messages",
-            new StringContent(payload.ToJsonString(), Encoding.UTF8, "application/json"),
-            ct);
+        var json = payload.ToJsonString();
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+
+        Wire.Write("http.req", "POST v1/messages → {0} · history={1} msgs · tools={2} · {3} bytes",
+            _http.BaseAddress, messages.Count, tools?.Count ?? 0, json.Length);
+        Wire.Json("http.req.body", json);
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, "v1/messages")
+        {
+            Content = new StringContent(json, Encoding.UTF8, "application/json"),
+        };
+        request.Headers.TryAddWithoutValidation("x-trace-id", traceId);
+
+        // Lets the gateway continue the DeepSeek chat this conversation already
+        // has open instead of creating a new session for every request.
+        if (!string.IsNullOrWhiteSpace(sessionKey))
+            request.Headers.TryAddWithoutValidation("x-agent-session", sessionKey);
+
+        using var response = await _http.SendAsync(request, ct);
+        Wire.Write("http.resp.hdr", "HTTP {0} · server_trace={1}", (int)response.StatusCode,
+            response.Headers.TryGetValues("x-trace-id", out var echoed) ? echoed.First() : "(not echoed)");
 
         var body = await response.Content.ReadAsStringAsync(ct);
+        Wire.Timing("http.resp", clock, "{0} · {1} bytes", (int)response.StatusCode, body.Length);
+        Wire.Json("http.resp.body", body);
+
         if (!response.IsSuccessStatusCode)
             throw new HttpRequestException($"HTTP {(int)response.StatusCode}: {Truncate(body, 500)}");
 
-        return ParseReply(body);
+        var reply = ParseReply(body);
+        Wire.Write("http.parsed", "stop_reason={0} · text={1} chars · tool_calls=[{2}]",
+            reply.StopReason, reply.Text.Length,
+            string.Join(", ", reply.ToolCalls.Select(c => $"{c.Name} args={c.Arguments.Length} chars")));
+        Wire.Block("http.parsed.text", reply.Text);
+        foreach (var call in reply.ToolCalls)
+            Wire.Json("http.parsed.tool", call.Arguments);
+
+        return reply;
     }
 
     private static AssistantReply ParseReply(string body)

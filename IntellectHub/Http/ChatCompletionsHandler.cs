@@ -37,12 +37,12 @@ internal sealed class ChatCompletionsHandler : IRequestHandler
         ChatCompletionRequest? request;
         try
         {
-            using var reader = new StreamReader(context.Request.InputStream, Encoding.UTF8);
-            var body = await reader.ReadToEndAsync(ct);
+            var body = await RequestTrace.ReadAsync(context, ct);
             request = JsonSerializer.Deserialize<ChatCompletionRequest>(body);
         }
         catch (JsonException ex)
         {
+            Wire.Write("body.in.err", "invalid JSON: {0}", ex.Message);
             await HttpResponses.WriteErrorAsync(context, 400, $"Invalid JSON body: {ex.Message}", "invalid_request_error");
             return;
         }
@@ -52,6 +52,9 @@ internal sealed class ChatCompletionsHandler : IRequestHandler
             await HttpResponses.WriteErrorAsync(context, 400, "Empty request body", "invalid_request_error");
             return;
         }
+
+        Wire.Write("body.in.sum", "model={0} · stream={1} · messages={2} · tools={3}",
+            request.Model ?? "(none)", request.Stream, request.Messages?.Count ?? 0, request.Tools?.Count ?? 0);
 
         request.SessionKey = RequestContext.SessionKey(context);
 
@@ -64,9 +67,12 @@ internal sealed class ChatCompletionsHandler : IRequestHandler
         }
         catch (UpstreamException ex)
         {
+            Wire.Write("body.in.upstream", "{0} ({1}): {2}", ex.StatusCode, ex.ErrorKind ?? "upstream", ex.Message);
             await HttpResponses.WriteErrorAsync(context, ex.StatusCode, ex.Message, ErrorType(ex));
             return;
         }
+
+        RequestTrace.Summarize("body.out.sum", result);
 
         var ids = ToolCallIds(result);
 

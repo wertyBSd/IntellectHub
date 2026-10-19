@@ -11,6 +11,11 @@ orig/
 
 # NuGet
 *.nupkg
+.nuget-home/
+/NuGet/
+
+# Build logs
+restore.log
 
 # OS
 Thumbs.db

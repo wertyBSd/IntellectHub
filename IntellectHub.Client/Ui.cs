@@ -16,7 +16,10 @@ public enum BarrierChoice
 public sealed class Ui : IDisposable
 {
     private static readonly string[] Frames = { "·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢" };
-    private static readonly string[] Commands = { "/help", "/models", "/config", "/project", "/clear", "/exit" };
+    // Driven by the command table so the sidebar cannot drift from what is actually
+// accepted at the prompt.
+    private static readonly string[] Commands =
+        CommandLine.Known.Where(c => !c.Hidden).Select(c => c.Name).ToArray();
 
     private const int HeaderHeight = 5;
     private const int FooterHeight = 3;
@@ -25,7 +28,11 @@ public sealed class Ui : IDisposable
 
     private readonly object _gate = new();
     private readonly List<Entry> _transcript = new();
-    private readonly List<string> _history = new();
+
+    // Recalled input is kept per prompt. One shared list meant that arrowing up
+    // inside /config offered previous chat messages, which is never what the
+    // person editing a setting wants to see.
+    private readonly Dictionary<string, List<string>> _historyByPrompt = new();
     private readonly List<string> _tools = new();
     private readonly CancellationTokenSource _cts = new();
     private readonly bool _interactive;
@@ -159,7 +166,7 @@ public sealed class Ui : IDisposable
         {
             _prompt = prompt;
             _input = "";
-            _histCursor = _history.Count;
+            _histCursor = HistoryFor(prompt).Count;
             _scrollFromBottom = 0;
         }
 
@@ -177,9 +184,10 @@ public sealed class Ui : IDisposable
                     lock (_gate)
                     {
                         text = _input.Trim();
-                        if (text.Length > 0 && (_history.Count == 0 || _history[^1] != text))
-                            _history.Add(text);
-                        _histCursor = _history.Count;
+                        var history = HistoryFor(prompt);
+                        if (text.Length > 0 && (history.Count == 0 || history[^1] != text))
+                            history.Add(text);
+                        _histCursor = history.Count;
                         _input = "";
                     }
                     return text;
@@ -228,13 +236,22 @@ public sealed class Ui : IDisposable
         }
     }
 
+    /// <summary>Callers hold <c>_gate</c>.</summary>
+    private List<string> HistoryFor(string prompt)
+    {
+        if (!_historyByPrompt.TryGetValue(prompt, out var history))
+            _historyByPrompt[prompt] = history = [];
+        return history;
+    }
+
     private void Navigate(int delta)
     {
         lock (_gate)
         {
-            if (_history.Count == 0) return;
-            _histCursor = Math.Clamp(_histCursor + delta, 0, _history.Count);
-            _input = _histCursor == _history.Count ? "" : _history[_histCursor];
+            var history = HistoryFor(_prompt);
+            if (history.Count == 0) return;
+            _histCursor = Math.Clamp(_histCursor + delta, 0, history.Count);
+            _input = _histCursor == history.Count ? "" : history[_histCursor];
         }
     }
 

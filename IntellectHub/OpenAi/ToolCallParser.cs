@@ -1,3 +1,5 @@
+using System.Globalization;
+using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -261,7 +263,30 @@ internal static partial class ToolCallParser
         return calls;
     }
 
-    /// <summary>Calls the client actually offered, de-duplicated and capped.</summary>
+    /// <summary>
+    /// Every tool name the reply asks for, whether or not the client offered it.
+    /// Used only for diagnostics: it is what lets the error say which tool the
+    /// model reached for instead of reporting "malformed markup" and leaving the
+    /// user with nothing to act on.
+    /// </summary>
+    internal static IReadOnlyList<string> MentionedToolNames(string? text)
+    {
+        if (string.IsNullOrEmpty(text)) return [];
+
+        var raw = HasDsmlToolMarkup(text) ? ListDsmlToolCalls(text) : CollectJsonToolCalls(text);
+
+        var names = new List<string>();
+        foreach (var call in raw)
+        {
+            if (string.IsNullOrWhiteSpace(call.Name)) continue;
+            if (IsPlaceholderName(call.Name)) continue;
+            if (!names.Contains(call.Name, StringComparer.OrdinalIgnoreCase)) names.Add(call.Name);
+        }
+
+        return names;
+    }
+
+    /// <summary>
     internal static IReadOnlyList<ParsedToolCall> CollectAgentToolCalls(string? text, IReadOnlySet<string> allowed)
     {
         if (string.IsNullOrEmpty(text) || allowed.Count == 0) return [];
@@ -272,14 +297,72 @@ internal static partial class ToolCallParser
         var seen = new HashSet<string>(StringComparer.Ordinal);
         foreach (var call in raw)
         {
-            if (!allowed.Contains(call.Name)) continue;
-            if (!seen.Add(call.Name + "\0" + call.Arguments)) continue;
-            calls.Add(call);
+            var name = AllowedName(call.Name, allowed);
+            if (name is null) continue;
+            if (!seen.Add(name + "\0" + call.Arguments)) continue;
+            calls.Add(name == call.Name ? call : call with { Name = name });
             if (calls.Count >= MaxAgentToolCalls) break;
         }
 
         return calls;
     }
+
+    /// <summary>
+    /// The name to act under, or null when the client never offered anything that
+    /// matches. An exact hit wins; otherwise DeepSeek's own tool name is mapped
+    /// onto the client's equivalent.
+    ///
+    /// The mapping matters because the model is far more willing to reach for the
+    /// native name it knows from pretraining than for one from the manifest. A
+    /// prompt that names seven tools explicitly was still answered with
+    /// <c>write_file</c>, which the client calls <c>write</c>.
+    /// </summary>
+    private static string? AllowedName(string name, IReadOnlySet<string> allowed)
+    {
+        // An exact hit wins even for an odd name: a client really offering a tool
+        // called "none" gets it.
+        if (allowed.Contains(name)) return name;
+
+        // Otherwise "none" is the model declining to pick a tool. Reporting it as an
+        // unknown tool produced "DeepSeek called none, which this client does not
+        // offer", which reads as if the gateway had a tool with that name.
+        if (IsPlaceholderName(name)) return null;
+
+        foreach (var (native, local) in NativeToolAliases)
+        {
+            if (!string.Equals(native, name, StringComparison.OrdinalIgnoreCase)) continue;
+            if (allowed.Contains(local)) return local;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// DeepSeek Web's tool names mapped onto the equivalent a client is likely to
+    /// have offered. Only names whose arguments carry over are listed: the
+    /// client's own executor still validates the arguments, so a mismatch surfaces
+    /// as a tool error the model can read and correct rather than as a wrong
+    /// action silently taken.
+    /// </summary>
+    private static readonly (string Native, string Local)[] NativeToolAliases =
+    [
+        ("read_file", "read"),
+        ("read_files", "read"),
+        ("view_file", "read"),
+        ("write_file", "write"),
+        ("create_file", "write"),
+        ("edit_file", "edit"),
+        ("apply_patch", "edit"),
+        ("list_files", "glob"),
+        ("list_dir", "glob"),
+        ("run_command", "bash"),
+        ("run_commands", "bash"),
+        ("shell_command", "bash"),
+        ("terminal_command", "bash"),
+        ("exec_command", "bash"),
+        ("search_files", "grep"),
+        ("search_file", "grep"),
+    ];
 
     /// <summary>
     /// The call to act on. When the client offered tools, only those are
@@ -797,6 +880,15 @@ internal static partial class ToolCallParser
         }
     }
 
+    /// <summary>Names a model uses to mean "no tool", rather than to name one.</summary>
+    private static bool IsPlaceholderName(string name) =>
+        name.Equals("none", StringComparison.OrdinalIgnoreCase) ||
+        name.Equals("null", StringComparison.OrdinalIgnoreCase) ||
+        name.Equals("nil", StringComparison.OrdinalIgnoreCase) ||
+        name.Equals("no_tool", StringComparison.OrdinalIgnoreCase) ||
+        name.Equals("no-op", StringComparison.OrdinalIgnoreCase) ||
+        name.Equals("noop", StringComparison.OrdinalIgnoreCase);
+
     private static bool TryParseJsonObject(string raw, out JsonObject? value)
     {
         value = null;
@@ -805,6 +897,20 @@ internal static partial class ToolCallParser
         return value is not null;
     }
 
+    /// <summary>
+    /// Parses a tool payload, recovering from the one malformation these models
+    /// produce constantly: a multi-line file pasted into a JSON string with raw
+    /// newlines instead of escapes.
+    ///
+    /// Asked to write a document, the model answers with the right call and a
+    /// perfectly good body — and invalid JSON, because a string literal may not
+    /// contain a literal newline. Strict parsing throws the whole call away, the
+    /// turn ends in a 502, and the work is lost even though it was written out.
+    ///
+    /// The repair escapes only the characters that are illegal inside a JSON
+    /// string and touches nothing else, so a payload that was already valid is
+    /// passed through byte for byte.
+    /// </summary>
     private static bool TryParseJsonNode(string raw, out JsonNode? node)
     {
         node = null;
@@ -813,14 +919,92 @@ internal static partial class ToolCallParser
             node = JsonNode.Parse(raw);
             return true;
         }
-        catch (JsonException)
+        catch (Exception ex) when (ex is JsonException or ArgumentException)
+        {
+            // Fall through to the salvage attempt below.
+        }
+
+        var repaired = EscapeRawControlCharacters(raw);
+        if (repaired is null) return false;
+
+        try
+        {
+            node = JsonNode.Parse(repaired);
+            return true;
+        }
+        catch (Exception ex) when (ex is JsonException or ArgumentException)
         {
             return false;
         }
-        catch (ArgumentException)
+    }
+
+    /// <summary>
+    /// Escapes control characters that appear inside a JSON string literal, or
+    /// null when there is nothing to fix or the text is too damaged to be worth
+    /// rewriting.
+    /// </summary>
+    private static string? EscapeRawControlCharacters(string raw)
+    {
+        if (raw.Length == 0 || raw.Length > MaxToolMarkupChars) return null;
+
+        var inString = false;
+        var escaped = false;
+        var changed = false;
+
+        var sb = new StringBuilder(raw.Length + 64);
+        foreach (var ch in raw)
         {
-            return false;
+            if (inString)
+            {
+                if (escaped)
+                {
+                    escaped = false;
+                    sb.Append(ch);
+                    continue;
+                }
+
+                switch (ch)
+                {
+                    case '\\':
+                        escaped = true;
+                        sb.Append(ch);
+                        continue;
+
+                    case '"':
+                        inString = false;
+                        sb.Append(ch);
+                        continue;
+                }
+
+                if (ch is '\n' or '\r' or '\t')
+                {
+                    changed = true;
+                    sb.Append(ch switch
+                    {
+                        '\n' => "\\n",
+                        '\r' => "\\r",
+                        _ => "\\t",
+                    });
+                    continue;
+                }
+
+                // Anything else below 0x20 is equally illegal in a JSON string.
+                if (ch < ' ')
+                {
+                    changed = true;
+                    sb.Append("\\u").Append(((int)ch).ToString("x4", CultureInfo.InvariantCulture));
+                    continue;
+                }
+
+                sb.Append(ch);
+                continue;
+            }
+
+            if (ch == '"') inString = true;
+            sb.Append(ch);
         }
+
+        return changed ? sb.ToString() : null;
     }
 
     private static string? ExtractBalancedJsonAt(string text, int startIndex)

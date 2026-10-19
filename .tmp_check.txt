@@ -1,0 +1,34 @@
+﻿ORIG_EXISTS=False
+GITIGNORE:
+# Upstream reference sources â€” not our product
+orig/
+
+# Build output
+[Bb]in/
+[Oo]bj/
+
+# IDE
+.vs/
+*.user
+
+# NuGet
+*.nupkg
+.nuget-home/
+/NuGet/
+
+# Build logs
+restore.log
+
+# OS
+Thumbs.db
+.DS_Store
+STASH:
+SEARCH_ORIG:
+RECYCLE_ITEMS:
+index || C:\$Recycle.Bin\S-1-12-1-2348009698-1255112097-1215379601-2853773638\$RDHUB21.html
+style.css || C:\$Recycle.Bin\S-1-12-1-2348009698-1255112097-1215379601-2853773638\$RJIO7SC.css
+js || C:\$Recycle.Bin\S-1-12-1-2348009698-1255112097-1215379601-2853773638\$RYQ23JD
+RECYCLE_META:
+C:\$Recycle.Bin\S-1-12-1-2348009698-1255112097-1215379601-2853773638\$IDHUB21.html
+C:\$Recycle.Bin\S-1-12-1-2348009698-1255112097-1215379601-2853773638\$IJIO7SC.css
+C:\$Recycle.Bin\S-1-12-1-2348009698-1255112097-1215379601-2853773638\$IYQ23JD

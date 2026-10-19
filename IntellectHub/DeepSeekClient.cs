@@ -119,12 +119,28 @@ internal sealed class DeepSeekClient : IDeepSeekCompletion
         attempt.CancelAfter(TimeSpan.FromSeconds(_upstreamTimeoutSeconds));
         var token = attempt.Token;
 
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        Wire.Write("ds.begin", "account={0} · model={1} · prompt={2} chars · chat_session={3} · parent={4} · thinking={5} · search={6} · budget={7}s",
+            account.Id, model.ModelType, prompt.Length,
+            chatSessionId ?? "(new)", parentMessageId ?? "-",
+            thinkingEnabled ?? model.ThinkingEnabled, searchEnabled ?? model.SearchEnabled,
+            _upstreamTimeoutSeconds);
+
         // Resolved up front: a session created here has to be handed back so the
         // next turn can continue it instead of paying for another one.
         var sessionId = chatSessionId ?? await CreateSessionAsync(account, token);
 
         using var request = await BuildCompletionRequestAsync(account, model, prompt, sessionId, parentMessageId, thinkingEnabled, searchEnabled, token);
+        Wire.Block("ds.prompt", prompt);
+
+        var sendClock = System.Diagnostics.Stopwatch.StartNew();
         using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token);
+        Wire.Timing("ds.resp", sendClock, "HTTP {0} · {1} · {2} · retry-after={3}",
+            (int)response.StatusCode,
+            response.Content.Headers.ContentType?.MediaType ?? "-",
+            DescribeContentLength(response),
+            RetryAfterMs(response)?.ToString() ?? "-");
+
         await EnsureCompletionStreamAsync(response, token);
 
         await using var stream = await response.Content.ReadAsStreamAsync(token);
@@ -136,38 +152,73 @@ internal sealed class DeepSeekClient : IDeepSeekCompletion
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
+            Wire.Write("ds.timeout", "no answer within {0}s (headers took {1} ms)", _upstreamTimeoutSeconds, sendClock.ElapsedMilliseconds);
             throw new UpstreamException(
                 $"DeepSeek did not answer within {_upstreamTimeoutSeconds}s.", 504, errorKind: ErrorKinds.UpstreamTimeout);
         }
 
         // A 200 stream can still be a throttling notice rather than an answer.
         if (result.RateLimited)
+        {
+            Wire.Write("ds.throttled", "stream carried a rate-limit notice: {0}", result.RateLimitDetail ?? "(no detail)");
             throw new UpstreamRateLimitException(
                 $"completion stream throttled: {RateLimit.Describe(result.RateLimitDetail)}");
+        }
 
-        return result.Completion with { ChatSessionId = sessionId };
+        var completed = result.Completion with { ChatSessionId = sessionId };
+        Wire.Timing("ds.done", clock,
+            "content={0} chars · reasoning={1} chars · message_id={2} · finish={3} · session={4}",
+            completed.Content.Length, completed.ReasoningContent.Length,
+            completed.MessageId ?? "-", completed.FinishReason ?? "-", sessionId);
+        Wire.Block("ds.reply", completed.Content);
+        Wire.Block("ds.reasoning", completed.ReasoningContent);
+
+        return completed;
+    }
+
+    private static string DescribeContentLength(HttpResponseMessage response)
+    {
+        var length = response.Content.Headers.ContentLength;
+        return length is { } value ? $"{value} bytes" : "chunked";
     }
 
     public async Task<string> CreateSessionAsync(Account account, CancellationToken ct)
     {
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        Wire.Write("ds.session.req", "account={0} · POST {1}", account.Id, SessionCreatePath);
+
         using var request = BuildRequest(HttpMethod.Post, SessionCreatePath, account, null);
         request.Content = new StringContent("{}", Encoding.UTF8, "application/json");
         using var response = await _http.SendAsync(request, ct);
         var text = await response.Content.ReadAsStringAsync(ct);
+        Wire.Timing("ds.session.resp", clock, "HTTP {0} · {1} bytes", (int)response.StatusCode, text.Length);
+        Wire.Json("ds.session.body", text);
+
         if (!response.IsSuccessStatusCode || string.IsNullOrEmpty(DeepSeekJson.ExtractSessionId(text)))
         {
             // Session creation is where a throttled login usually announces itself first.
             if (RateLimit.IsSignal(text))
+            {
+                Wire.Write("ds.session.err", "throttled: {0}", RateLimit.Describe(text));
                 throw new UpstreamRateLimitException(
                     $"session create throttled: {RateLimit.Describe(text)}", RetryAfterMs(response));
+            }
 
             if (!response.IsSuccessStatusCode)
+            {
+                Wire.Write("ds.session.err", "HTTP {0}", (int)response.StatusCode);
                 throw new UpstreamException($"session create HTTP {(int)response.StatusCode}: {Truncate(text)}", (int)response.StatusCode);
+            }
         }
 
         var id = DeepSeekJson.ExtractSessionId(text);
         if (string.IsNullOrEmpty(id))
+        {
+            Wire.Write("ds.session.err", "HTTP {0} but no session id in the body", (int)response.StatusCode);
             throw new UpstreamException($"session create returned no id: {Truncate(text)}");
+        }
+
+        Wire.Write("ds.session.ok", "chat_session_id={0}", id);
         return id;
     }
 
@@ -198,6 +249,7 @@ internal sealed class DeepSeekClient : IDeepSeekCompletion
 
         var request = BuildRequest(HttpMethod.Post, CompletionPath, account, powHeader);
         request.Content = new StringContent(body, Encoding.UTF8, "application/json");
+        Wire.Json("ds.req.body", body);
         return request;
     }
 
@@ -206,17 +258,25 @@ internal sealed class DeepSeekClient : IDeepSeekCompletion
         var solver = _pow.Solver ?? throw new UpstreamException(
             "PoW solver not configured: the DeepSeek SHA3 WASM module could not be loaded.", 503);
 
+        var clock = System.Diagnostics.Stopwatch.StartNew();
         var body = JsonSerializer.Serialize(new { target_path = targetPath });
         using var request = BuildRequest(HttpMethod.Post, PowPath, account, null);
         request.Content = new StringContent(body, Encoding.UTF8, "application/json");
         using var response = await _http.SendAsync(request, ct);
         var text = await response.Content.ReadAsStringAsync(ct);
+        Wire.Write("ds.pow.resp", "HTTP {0} · {1} ms · {2} bytes", (int)response.StatusCode, clock.ElapsedMilliseconds, text.Length);
+        Wire.Json("ds.pow.challenge", text);
+
         if (!response.IsSuccessStatusCode)
         {
             if (RateLimit.IsSignal(text))
+            {
+                Wire.Write("ds.pow.err", "throttled: {0}", RateLimit.Describe(text));
                 throw new UpstreamRateLimitException(
                     $"pow challenge throttled: {RateLimit.Describe(text)}", RetryAfterMs(response));
+            }
 
+            Wire.Write("ds.pow.err", "HTTP {0}", (int)response.StatusCode);
             throw new UpstreamException($"pow challenge HTTP {(int)response.StatusCode}: {Truncate(text)}", (int)response.StatusCode);
         }
 
@@ -224,7 +284,10 @@ internal sealed class DeepSeekClient : IDeepSeekCompletion
             ?? throw new UpstreamException($"pow response has no challenge: {Truncate(text)}");
 
         var wasmUrl = account.Config.WasmUrl ?? string.Empty;
+        var solveClock = System.Diagnostics.Stopwatch.StartNew();
         var answer = await solver.SolveAsync(challenge, wasmUrl, ct);
+        Wire.Write("ds.pow.solved", "algorithm={0} · difficulty={1} · answer={2} · solved in {3} ms",
+            challenge.Algorithm ?? "?", challenge.Difficulty, answer, solveClock.ElapsedMilliseconds);
         return PowPayload.BuildBase64(challenge, answer, targetPath);
     }
 
@@ -236,6 +299,10 @@ internal sealed class DeepSeekClient : IDeepSeekCompletion
         request.Headers.TryAddWithoutValidation("Accept", "text/event-stream");
         if (powHeader is not null)
             request.Headers.TryAddWithoutValidation("X-DS-PoW-Response", powHeader);
+
+        // Credentials are masked by name, so what is logged is the header *shape*.
+        Wire.Write("ds.req", "{0} {1}", method, BaseUrl + path);
+        Wire.Headers("ds.req.hdr", request.Headers);
         return request;
     }
 
@@ -253,6 +320,8 @@ internal sealed class DeepSeekClient : IDeepSeekCompletion
         {
             var text = await response.Content.ReadAsStringAsync(ct);
             var retryAfter = RetryAfterMs(response);
+            Wire.Write("ds.resp.err", "HTTP {0} · retry-after={1}", (int)response.StatusCode, retryAfter?.ToString() ?? "-");
+            Wire.Json("ds.resp.body", text);
 
             if (RateLimit.IsSignal(text))
                 throw new UpstreamRateLimitException(
@@ -271,6 +340,8 @@ internal sealed class DeepSeekClient : IDeepSeekCompletion
 
         // A 200 that is JSON instead of a stream: either a business error or a throttle.
         var body = await response.Content.ReadAsStringAsync(ct);
+        Wire.Write("ds.resp.json", "HTTP 200 but application/json, not text/event-stream · {0} bytes", body.Length);
+        Wire.Json("ds.resp.body", body);
         if (RateLimit.IsSignal(body))
             throw new UpstreamRateLimitException($"completion throttled: {RateLimit.Describe(body)}");
 
@@ -285,18 +356,54 @@ internal sealed class DeepSeekClient : IDeepSeekCompletion
     {
         var accumulator = new SseAccumulator();
         using var reader = new StreamReader(stream, Encoding.UTF8);
+
+        // A full reply can run to thousands of frames. The first ones carry the
+        // protocol shape and any throttle notice, so those go in verbatim; the rest
+        // are counted, because a token-by-token dump buries everything else.
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        var lines = 0;
+        var logged = 0;
+
         while (true)
         {
             var line = await reader.ReadLineAsync(ct);
             if (line is null) break;
+            lines++;
+
+            if (logged < 40 && !string.IsNullOrWhiteSpace(line))
+            {
+                logged++;
+                Wire.Block("ds.sse", line);
+            }
+
             accumulator.Consume(line);
         }
 
+        var messageId = ResolveMessageId(accumulator.MessageId);
+        Wire.Timing("ds.sse.end", clock, "{0} SSE lines · first {1} captured verbatim · message_id={2}",
+            lines, logged, messageId ?? "(rejected: not a UUID)");
+
         return new StreamRead(
-            new UpstreamResult(accumulator.Content, accumulator.ReasoningContent, accumulator.MessageId, accumulator.FinishReason),
+            new UpstreamResult(accumulator.Content, accumulator.ReasoningContent, messageId, accumulator.FinishReason),
             accumulator.RateLimited,
             accumulator.RateLimitDetail);
     }
+
+    /// <summary>
+    /// Keeps a message id only if it is shaped like one.
+    ///
+    /// The stream carries both "response_message_id" and "response.message_id", and
+    /// the first one to arrive wins when nothing overrides it. In the field that
+    /// value has been the small per-response sequence number — 2, 3, 4 — not an id.
+    /// Handing that back as the next request's parent_message_id makes DeepSeek
+    /// reject the whole request with a 422 and a deserialisation error naming the
+    /// column, which reads like a protocol bug and is really a bad id.
+    ///
+    /// A rejected id is dropped rather than repaired: without one the next turn
+    /// simply opens a new session, which is slower but correct.
+    /// </summary>
+    private static string? ResolveMessageId(string? candidate) =>
+        candidate is not null && Guid.TryParse(candidate, out _) ? candidate : null;
 
     private static long? RetryAfterMs(HttpResponseMessage response)
     {
