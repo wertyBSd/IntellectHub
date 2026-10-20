@@ -289,6 +289,26 @@ async Task RunTurnAsync()
 
             if (_planner is not null)
             {
+                // Если модель вернула пустой текст или только placeholder-вызов,
+                // подзадача не выполнена — просим модель написать содержимое раздела
+                // повторно, не пропуская её.
+                if (string.IsNullOrWhiteSpace(reply.Text.Trim()))
+                {
+                    screen.Write($"Подзадача {_planner.Current!.Index + 1} не выполнена — модель не прислала содержимое, повторяем запрос.", ConsoleColor.Yellow);
+                    var retryPrompt = new ChatMessage
+                    {
+                        Role = "user",
+                        Content = JsonValue.Create(
+                            $"Ты должен написать содержимое подзадачи {_planner.Current.Index + 1} из {_planner.Total}: \"{_planner.Current.Title}\".\n\n" +
+                            $"Описание: {_planner.Current.Description}\n\n" +
+                            $"Напиши текст раздела целиком, используя инструмент write/edit. Не присылай пустой ответ и не отказывайся от инструментов.")
+                    };
+                    history.Add(retryPrompt);
+                    Wire.TraceId = turnId;
+                    Wire.Write("turn", "subtask {0} empty · retrying with stricter prompt", _planner.Current!.Index + 1);
+                    continue; // ask model again for this subtask
+                }
+
                 // Модель закончила текущую подзадачу (текст без вызовов инструментов).
                 _planner.MarkCurrentDone(reply.Text.Trim());
                 screen.Write($"Подзадача {_planner.Current?.Index ?? _planner.Total} готова.", ConsoleColor.Green);
