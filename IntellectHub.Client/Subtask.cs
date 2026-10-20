@@ -9,6 +9,7 @@ public sealed class Subtask
     public SubtaskStatus Status { get; set; } = SubtaskStatus.Pending;
     public string? Result { get; set; }
     public string? Error { get; set; }
+    public int Attempts { get; set; } = 0;
 }
 
 public enum SubtaskStatus

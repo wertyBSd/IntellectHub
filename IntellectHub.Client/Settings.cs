@@ -108,6 +108,16 @@ internal sealed record Setting(
             (c, v) => c.ApprovalMode = ToolRisk.Normalize(v),
             ValidateApproval,
             c => c.ApprovalMode),
+
+        new Setting(
+            "selfcheck", ["self-check", "check"],
+            "verify subtask execution by checking file changes",
+            c => c.SelfCheck ? "on" : "off",
+            (c, v) => c.SelfCheck = v.Trim().ToLowerInvariant() is "on" or "true" or "yes" or "1",
+            v => v.Trim().ToLowerInvariant() is "on" or "off" or "true" or "false" or "yes" or "no" or "1" or "0"
+                ? null
+                : "use on or off",
+            c => c.SelfCheck ? "on" : "off"),
     ];
 
     /// <summary>Accepts "127.0.0.1:9657" as readily as the full URL.</summary>

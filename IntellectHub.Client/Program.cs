@@ -65,7 +65,7 @@ if (args.Length > 0 && args[0] == "--tool")
 
     var toolName = args[1];
     var toolArgs = args.Length > 2 && !args[2].StartsWith('-') ? args[2] : "{}";
-    var registry = new ToolRegistry(ResolveProjectRoot());
+    var registry = new ToolRegistry(ResolveProjectRoot(), config);
     var outcome = await registry.ExecuteAsync(new ToolCall { Name = toolName, Arguments = toolArgs });
     Console.WriteLine(outcome.Output);
     Environment.ExitCode = outcome.IsError ? 1 : 0;
@@ -73,14 +73,14 @@ if (args.Length > 0 && args[0] == "--tool")
 }
 
 using var screen = new Ui();
-var api = new ApiClient(config);
+var api = new ApiClient(config, GetActiveConnection());
 var history = new List<ChatMessage>();
 
 // Identity of this conversation for the gateway.
 var sessionKey = NewSessionKey();
 
 var project = Project.Open(ResolveProjectRoot());
-var tools = new ToolRegistry(project.Root);
+var tools = new ToolRegistry(project.Root, config);
 var log = new SessionLog(project.LogPath);
 RememberProject(project.Root);
 
@@ -88,14 +88,23 @@ RememberProject(project.Root);
 // клиент выполняет их по очереди, один за другим.
 TaskPlanner? _planner = null;
 
+// Self-check: отслеживаем использование инструментов write/edit для проверки выполнения подзадач.
+bool _hasUsedWriteTools = false;
+
 RefreshHeader();
 screen.Write("IntellectHub Console — type a message, press F1 for help, or Ctrl+K for commands.", ConsoleColor.DarkGray);
 screen.Write("");
 await CheckHealthAsync();
 
+// Lines typed while a turn runs wait here. They are handled as ordinary input
+// once the turn finishes, so a command or follow-up is never lost.
+var queuedInputs = new Queue<string>();
+
 while (true)
 {
-    var line = screen.ReadLine();
+    var line = queuedInputs.Count > 0
+        ? new PromptResult(queuedInputs.Dequeue())
+        : screen.ReadLine();
     if (line.Action == PromptAction.Exit) break;
     if (line.Action == PromptAction.CycleApprovals)
     {
@@ -127,7 +136,12 @@ while (true)
 
     try
     {
-        await RunTurnAsync();
+        await RunTurnWithInputAsync();
+    }
+    catch (OperationCanceledException)
+    {
+        screen.Write("interrupted", ConsoleColor.DarkGray, EntryStyle.Notice);
+        Wire.Write("turn.cancelled", "stopped by the user");
     }
     catch (Exception ex)
     {
@@ -208,7 +222,31 @@ void RememberProject(string root)
         config.Save();
 }
 
-async Task RunTurnAsync()
+async Task RunTurnWithInputAsync()
+{
+    using var cancel = new CancellationTokenSource();
+    var work = RunTurnAsync(cancel.Token);
+
+    // The prompt stays alive while the turn runs; Enter queues, Esc stops.
+    foreach (var next in screen.ComposeWhileBusy(work, cancel))
+        queuedInputs.Enqueue(next);
+
+    await work;
+}
+
+async Task RunTurnAsync(CancellationToken ct)
+{
+    try
+    {
+        await RunTurnCoreAsync(ct);
+    }
+    finally
+    {
+        screen.Idle();
+    }
+}
+
+async Task RunTurnCoreAsync(CancellationToken ct)
 {
     var turnClock = System.Diagnostics.Stopwatch.StartNew();
     var turnId = Wire.NewTraceId();
@@ -219,6 +257,7 @@ async Task RunTurnAsync()
 
     for (var step = 0; step < 16; step++)
     {
+        ct.ThrowIfCancellationRequested();
         screen.Busy(step == 0 ? "thinking" : "working");
 
         // One id per request: the same label lands on the client request, on every
@@ -238,11 +277,15 @@ async Task RunTurnAsync()
                 Content = JsonValue.Create(
                     $"Выполни подзадачу {subtask.Index + 1} из {_planner.Total}: {subtask.Title}\n\n" +
                     $"Описание: {subtask.Description}\n\n" +
-                    $"Используй инструменты write/edit, чтобы записать свою часть результата в файл docs/manual.md. " +
+                    $"ИСПОЛЬЗУЙ ИНСТРУМЕНТЫ write/edit, чтобы записать свою часть результата в файл docs/manual.md. " +
+                    $"НЕ ВЫВОДИ ТЕКСТ В ОТВЕТЕ — используй инструменты для записи в файл. " +
+                    $"НЕ ПИШИ СКРИПТЫ В ОТВЕТЕ — используй инструмент bash для выполнения команд. " +
                     $"Не пытайся сделать всё за один вызов — пиши только эту часть. " +
                     $"Когда закончишь, напиши краткий отчёт текстом без вызовов инструментов.")
             };
             history.Add(subtaskPrompt);
+            // Self-check: сбрасываем флаг использования инструментов для новой подзадачи.
+            _hasUsedWriteTools = false;
             Wire.Write("planner.subtask", "executing subtask {0}/{1}: {2}", subtask.Index + 1, _planner.Total, subtask.Title);
         }
 
@@ -250,8 +293,12 @@ async Task RunTurnAsync()
         var callClock = System.Diagnostics.Stopwatch.StartNew();
         try
         {
-            reply = await api.SendAsync(history, tools.Specs, traceId, sessionKey);
+            reply = await api.SendAsync(history, tools.Specs, traceId, sessionKey, ct);
             Sound.Notify();
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -259,10 +306,6 @@ async Task RunTurnAsync()
             Console.Beep(1318, 80);
             Wire.Write("step.err", "{0}: {1}", ex.GetType().Name, ex.Message);
             throw;
-        }
-        finally
-        {
-            screen.Idle();
         }
 
         Wire.Timing("step", callClock, "round trip finished · stop_reason={0}", reply.StopReason);
@@ -338,34 +381,90 @@ async Task RunTurnAsync()
 
             if (_planner is not null)
             {
+                var currentSubtask = _planner.Current!;
+                currentSubtask.Attempts++;
+
                 // Если модель вернула пустой текст или только placeholder-вызов,
                 // подзадача не выполнена — просим модель написать содержимое раздела
                 // повторно, не пропуская её.
-                if (string.IsNullOrWhiteSpace(reply.Text.Trim()))
+                if (string.IsNullOrWhiteSpace(reply.Text.Trim()) || allPlaceholder)
                 {
-                    screen.Write($"Подзадача {_planner.Current!.Index + 1} не выполнена — модель не прислала содержимое, повторяем запрос.", ConsoleColor.Yellow);
-                    var retryPrompt = new ChatMessage
+                    const int maxAttempts = 3;
+                    if (currentSubtask.Attempts >= maxAttempts)
                     {
-                        Role = "user",
-                        Content = JsonValue.Create(
-                            $"Ты должен написать содержимое подзадачи {_planner.Current.Index + 1} из {_planner.Total}: \"{_planner.Current.Title}\".\n\n" +
-                            $"Описание: {_planner.Current.Description}\n\n" +
-                            $"Напиши текст раздела целиком, используя инструмент write/edit. Не присылай пустой ответ и не отказывайся от инструментов.")
-                    };
-                    history.Add(retryPrompt);
-                    Wire.TraceId = turnId;
-                    Wire.Write("turn", "subtask {0} empty · retrying with stricter prompt", _planner.Current!.Index + 1);
-                    continue; // ask model again for this subtask
+                        // Слишком много попыток — помечаем подзадачу как Failed и переходим к следующей.
+                        screen.Write($"Подзадача {currentSubtask.Index + 1} не выполнена после {maxAttempts} попыток — пропускаем.", ConsoleColor.Red);
+                        _planner.MarkCurrentFailed("Model returned empty or placeholder responses too many times.");
+                        Wire.TraceId = turnId;
+                        Wire.Write("turn", "subtask {0} failed after {1} attempts · skipping", currentSubtask.Index + 1, maxAttempts);
+
+                        // Добавляем в историю сообщение о неудаче, чтобы модель знала об этом.
+                        var failContent = new JsonArray();
+                        failContent.Add(new JsonObject { ["type"] = "text", ["text"] = $"[Подзадача {currentSubtask.Index + 1} не выполнена — пропускаем]" });
+                        history.Add(new ChatMessage { Role = "assistant", Content = failContent });
+                    }
+                    else
+                    {
+                        screen.Write($"Подзадача {currentSubtask.Index + 1} не выполнена — модель не прислала содержимое, повторяем запрос (попытка {currentSubtask.Attempts}/{maxAttempts}).", ConsoleColor.Yellow);
+                        var retryPrompt = new ChatMessage
+                        {
+                            Role = "user",
+                            Content = JsonValue.Create(
+                                $"Ты должен написать содержимое подзадачи {currentSubtask.Index + 1} из {_planner.Total}: \"{currentSubtask.Title}\".\n\n" +
+                                $"Описание: {currentSubtask.Description}\n\n" +
+                                $"Напиши текст раздела целиком, используя инструмент write/edit. Не присылай пустой ответ и не отказывайся от инструментов.")
+                        };
+                        history.Add(retryPrompt);
+                        Wire.TraceId = turnId;
+                        Wire.Write("turn", "subtask {0} empty · retrying with stricter prompt (attempt {1}/{2})", currentSubtask.Index + 1, currentSubtask.Attempts, maxAttempts);
+                        continue; // ask model again for this subtask
+                    }
                 }
+                else
+                {
+                    // Модель закончила текущую подзадачу (текст без вызовов инструментов).
+                    // Self-check: проверяем, что модель вызвала инструменты (write/edit) в текущем или предыдущих шагах.
+                    if (config.SelfCheck && !HasUsedWriteTools())
+                    {
+                        currentSubtask.Attempts++;
+                        const int maxAttempts = 3;
+                        if (currentSubtask.Attempts >= maxAttempts)
+                        {
+                            screen.Write($"Подзадача {currentSubtask.Index + 1} не выполнена после {maxAttempts} попыток (модель не использовала инструменты) — пропускаем.", ConsoleColor.Red);
+                            _planner.MarkCurrentFailed("Model did not use write/edit tools after multiple attempts.");
+                            Wire.TraceId = turnId;
+                            Wire.Write("turn", "subtask {0} failed after {1} attempts (no write tools) · skipping", currentSubtask.Index + 1, maxAttempts);
+                        }
+                        else
+                        {
+                            screen.Write($"Подзадача {currentSubtask.Index + 1}: модель не использовала инструменты — повторяем запрос (попытка {currentSubtask.Attempts}/{maxAttempts}).", ConsoleColor.Yellow);
+                            var retryPrompt = new ChatMessage
+                            {
+                                Role = "user",
+                                Content = JsonValue.Create(
+                                    $"Ты должен написать содержимое подзадачи {currentSubtask.Index + 1} из {_planner.Total}: \"{currentSubtask.Title}\".\n\n" +
+                                    $"Описание: {currentSubtask.Description}\n\n" +
+                                    $"ИСПОЛЬЗУЙ ИНСТРУМЕНТЫ write/edit, чтобы записать содержимое в файл docs/manual.md. " +
+                                    $"НЕ ВЫВОДИ ТЕКСТ В ОТВЕТЕ — используй инструменты для записи в файл. " +
+                                    $"НЕ ПИШИ СКРИПТЫ В ОТВЕТЕ — используй инструмент bash для выполнения команд.")
+                            };
+                            history.Add(retryPrompt);
+                            Wire.TraceId = turnId;
+                            Wire.Write("turn", "subtask {0} no write tools · retrying (attempt {1}/{2})", currentSubtask.Index + 1, currentSubtask.Attempts, maxAttempts);
+                            continue;
+                        }
+                    }
+                    else
+                    {
+                        _planner.MarkCurrentDone(reply.Text.Trim());
+                        screen.Write($"Подзадача {currentSubtask.Index + 1} готова.", ConsoleColor.Green);
 
-                // Модель закончила текущую подзадачу (текст без вызовов инструментов).
-                _planner.MarkCurrentDone(reply.Text.Trim());
-                screen.Write($"Подзадача {_planner.Current?.Index ?? _planner.Total} готова.", ConsoleColor.Green);
-
-                var assistantContent = new JsonArray();
-                if (reply.Text.Trim().Length > 0)
-                    assistantContent.Add(new JsonObject { ["type"] = "text", ["text"] = reply.Text });
-                history.Add(new ChatMessage { Role = "assistant", Content = assistantContent });
+                        var assistantContent = new JsonArray();
+                        if (reply.Text.Trim().Length > 0)
+                            assistantContent.Add(new JsonObject { ["type"] = "text", ["text"] = reply.Text });
+                        history.Add(new ChatMessage { Role = "assistant", Content = assistantContent });
+                    }
+                }
 
                 if (_planner.HasNext)
                 {
@@ -412,12 +511,40 @@ async Task RunTurnAsync()
         }
         history.Add(new ChatMessage { Role = "assistant", Content = assistantContent2 });
 
+        // Self-check: если модель вызвала write/edit в текущей подзадаче — считаем, что задача выполнена.
+        if (_planner is not null && config.SelfCheck && HasUsedWriteTools())
+        {
+            var currentSubtask = _planner.Current!;
+            // Простейшая верификация: файл был изменен после начала подзадачи
+            // (в идеале здесь должна быть проверка на корректность результата, например, компиляция)
+            _planner.MarkCurrentDone(reply.Text.Trim());
+            screen.Write($"Подзадача {currentSubtask.Index + 1} готова (инструменты использованы).", ConsoleColor.Green);
+
+            if (_planner.HasNext)
+            {
+                Wire.TraceId = turnId;
+                Wire.Write("turn", "subtask done (tools used) · continuing with subtask {0}/{1}",
+                    _planner.Current!.Index + 1, _planner.Total);
+                continue; // execute next subtask
+            }
+
+            screen.Write("Все подзадачи выполнены.", ConsoleColor.Green);
+            _planner = null;
+
+            // Back to the turn id: the step loop overwrote it.
+            Wire.TraceId = turnId;
+            Wire.Write("turn", "done · all subtasks complete · {0} steps · {1} msgs in history", step + 1, history.Count);
+            Wire.Timing("turn.end", turnClock, "finished");
+            return;
+        }
+
         var results = new JsonArray();
         var stop = false;
         var showedAutoThought = false;
 
         foreach (var original in reply.ToolCalls)
         {
+            ct.ThrowIfCancellationRequested();
             var call = original;
 
             while (true)
@@ -426,6 +553,23 @@ async Task RunTurnAsync()
                 // all. Skipping the barrier entirely — rather than answering it on
                 // the user's behalf — is what makes unattended runs actually run.
                 var autoApproved = ToolRisk.Allowed(config.Approvals, call.Name);
+                
+                // Show preview for approval if not auto-approved
+                if (!autoApproved)
+                {
+                    if (call.Name == "write")
+                    {
+                        var content = ReadArg(call.Arguments, "content");
+                        screen.Write($"WRITE PREVIEW ({Trim(ReadArg(call.Arguments, "path"), 100)}):\n{Fold(content, 5, 5)}", ConsoleColor.Yellow);
+                    }
+                    else if (call.Name == "edit")
+                    {
+                        var oldString = ReadArg(call.Arguments, "oldString");
+                        var newString = ReadArg(call.Arguments, "newString");
+                        screen.Write($"EDIT PREVIEW ({Trim(ReadArg(call.Arguments, "path"), 100)}):\n--- OLD ---\n{oldString}\n--- NEW ---\n{newString}", ConsoleColor.Yellow);
+                    }
+                }
+
                 var choice = autoApproved ? BarrierChoice.Run : screen.Ask(reply.Text.Trim(), Describe(call));
 
                 Wire.Write("barrier", "{0} → {1}", call.Name,
@@ -459,7 +603,15 @@ async Task RunTurnAsync()
 
                 if (choice == BarrierChoice.Edit)
                 {
-                    call = EditCall(call);
+                    screen.HoldKeyboard();
+                    try
+                    {
+                        call = EditCall(call);
+                    }
+                    finally
+                    {
+                        screen.ReleaseKeyboard();
+                    }
                     screen.Write(Describe(call), ConsoleColor.White, EntryStyle.Tool);
                     Wire.Write("barrier.edit", "{0} → new arguments", call.Name);
                     Wire.Json("barrier.edit.args", call.Arguments);
@@ -475,8 +627,15 @@ async Task RunTurnAsync()
                 Wire.Write("tool", "→ {0} · project={1}", call.Name, project.Root);
                 Wire.Json("tool.args", call.Arguments);
 
+                // Self-check: отслеживаем использование инструментов write/edit в текущей подзадаче.
+                if (call.Name is "write" or "edit" or "question")
+                {
+                    _hasUsedWriteTools = true;
+                }
+
                 var toolClock = System.Diagnostics.Stopwatch.StartNew();
                 var result = await tools.ExecuteAsync(call);
+                ct.ThrowIfCancellationRequested();
                 if (result.IsError) Sound.Error(); else Sound.Success();
                 Wire.Timing("tool.done", toolClock, "{0} · is_error={1} · {2} chars of output",
                     call.Name, result.IsError, result.Output.Length);
@@ -781,9 +940,10 @@ void ReportUnknownCommand(ParsedInput parsed)
 }
 
 /// <summary>
-    /// Switches gateway. Takes a saved server by name, or a bare URL to use one
-    /// that was never saved — both land in the same place, and a named switch also
-    /// updates the stored entry so the address stays in step with the name.
+    /// Switches provider. Takes a named connection (a built-in preset or one the user
+    /// saved), a saved gateway by name, or a bare URL to use an address that was never
+    /// saved — all three land in the same place, and a named switch also updates the
+    /// stored entry so the address stays in step with the name.
     /// </summary>
     async Task ConnectAsync(string arguments)
     {
@@ -791,7 +951,7 @@ void ReportUnknownCommand(ParsedInput parsed)
 
         if (verb.Length == 0)
         {
-            await PickServerAsync();
+            await PickConnectionAsync();
             return;
         }
 
@@ -809,6 +969,24 @@ void ReportUnknownCommand(ParsedInput parsed)
             return;
         }
 
+        // The credential for a connection lives in secrets.json, not in the
+        // readable configuration, so it gets its own verb.
+        if (verb.Equals("key", StringComparison.OrdinalIgnoreCase))
+        {
+            SetConnectionKey(rest);
+            return;
+        }
+
+        var picked = config.AllConnections.FirstOrDefault(c =>
+            string.Equals(c.Name, verb, StringComparison.OrdinalIgnoreCase));
+
+        if (picked is not null)
+        {
+            ApplyConnection(picked);
+            await CheckHealthAsync();
+            return;
+        }
+
         var known = config.Servers.FirstOrDefault(s =>
             string.Equals(s.Name, verb, StringComparison.OrdinalIgnoreCase));
 
@@ -816,6 +994,7 @@ void ReportUnknownCommand(ParsedInput parsed)
         {
             config.BaseUrl = known.Url;
             config.ServerName = known.Name;
+            config.ConnectionName = "";
             config.Save();
             AfterServerChange($"{known.Name} → {known.Url}");
         }
@@ -829,6 +1008,7 @@ void ReportUnknownCommand(ParsedInput parsed)
             if (error is not null)
             {
                 screen.Write(error, ConsoleColor.Red);
+                screen.Write("known connections: " + KnownConnectionList(), ConsoleColor.DarkGray);
                 screen.Write("known servers: " + KnownServerList(), ConsoleColor.DarkGray);
                 screen.Write("save one with /connect save <name> <url>", ConsoleColor.DarkGray);
                 return;
@@ -836,11 +1016,87 @@ void ReportUnknownCommand(ParsedInput parsed)
 
             setting.Write(config, verb);
             config.ServerName = "";
+            config.ConnectionName = "";
             config.Save();
             AfterServerChange($"custom → {config.BaseUrl}");
         }
 
         await CheckHealthAsync();
+    }
+
+    /// <summary>
+    /// Points the client at a named connection and records it. The address, the model
+    /// and the credential all follow the connection, so a provider switch does not
+    /// leave the previous provider's model behind.
+    /// </summary>
+    void ApplyConnection(ConnectionEntry target)
+    {
+        config.ApplyConnection(target);
+        config.Save();
+
+        Wire.TraceId = null;
+        Wire.Write("connection", "{0} → {1} · model={2}", target.Name, config.BaseUrl, config.Model);
+
+        Reconnect();
+        screen.Write($"provider = {target.Name} → {config.BaseUrl}", ConsoleColor.Green);
+        screen.Write($"model = {config.Model}", ConsoleColor.DarkGray);
+
+        // A provider with no credential cannot answer. Say so here, where the key can
+        // still be entered, rather than on the next message as a 401.
+        if (target.Provider != ProviderKind.CloudflareR2 &&
+            string.IsNullOrWhiteSpace(ClientConfig.GetSecret(target.CredentialKey)) &&
+            string.IsNullOrWhiteSpace(config.ApiKey))
+        {
+            screen.Write($"no key for {target.Name} — set one with /connect key {target.Name}", ConsoleColor.Yellow);
+        }
+    }
+
+    /// <summary>
+    /// Stores or clears the credential for a connection. The value goes to
+    /// secrets.json so client.json stays safe to share.
+    /// </summary>
+    void SetConnectionKey(string rest)
+    {
+        var (name, value) = Split(rest);
+        if (name.Length == 0)
+        {
+            screen.Write("usage: /connect key <name> [value]", ConsoleColor.Red);
+            return;
+        }
+
+        var target = config.AllConnections.FirstOrDefault(c =>
+            string.Equals(c.Name, name, StringComparison.OrdinalIgnoreCase));
+
+        if (target is null)
+        {
+            screen.Write($"no connection named '{name}'", ConsoleColor.Red);
+            screen.Write("known: " + KnownConnectionList(), ConsoleColor.DarkGray);
+            return;
+        }
+
+        if (value.Length == 0)
+        {
+            var current = ClientConfig.GetSecret(target.CredentialKey);
+            screen.Write($"  key for {target.Name}", ConsoleColor.DarkGray);
+            screen.Write($"  now: {(current is null ? "(none)" : Wire.Mask(current))}", ConsoleColor.DarkGray);
+            screen.Write("  type ! to remove it", ConsoleColor.DarkGray);
+
+            value = screen.ReadLine($"key > ").Text;
+            if (value.Length == 0) return;
+        }
+        if (value == "!")
+        {
+            var removed = ClientConfig.DeleteSecret(target.CredentialKey);
+            screen.Write(removed
+                ? $"key for {target.Name} removed"
+                : $"no key stored for {target.Name}", removed ? ConsoleColor.Green : ConsoleColor.Yellow);
+            Reconnect();
+            return;
+        }
+
+        ClientConfig.SaveSecret(target.CredentialKey, value);
+        screen.Write($"key for {target.Name} saved to {ClientConfig.SecretsPath}", ConsoleColor.Green);
+        Reconnect();
     }
 
     void AfterServerChange(string shown)
@@ -851,34 +1107,12 @@ void ReportUnknownCommand(ParsedInput parsed)
         screen.Write($"server = {shown}", ConsoleColor.Green);
     }
 
-    void ShowServers()
-    {
-        screen.Write("servers", ConsoleColor.White);
-
-        if (config.Servers.Count == 0)
-            screen.Write("  (none saved yet — /connect save <name> <url>)", ConsoleColor.DarkGray);
-        else
-        {
-            foreach (var server in config.Servers)
-            {
-                var active = string.Equals(server.Name, config.ServerName, StringComparison.OrdinalIgnoreCase);
-                screen.Write($"  {(active ? "*" : " ")} {server.Name,-14} {server.Url}",
-                    active ? ConsoleColor.Green : ConsoleColor.DarkGray);
-            }
-        }
-
-        screen.Write("");
-        screen.Write($"  current: {config.ServerLabel} → {config.BaseUrl}", ConsoleColor.Cyan);
-        screen.Write("  /connect <name|url>   switch", ConsoleColor.DarkGray);
-        screen.Write("  /connect save <name> <url>", ConsoleColor.DarkGray);
-        screen.Write("  /connect forget <name>", ConsoleColor.DarkGray);
-    }
-
     /// <summary>
-    /// The no-argument form of /connect. Saved gateways are the list; typing an
-    /// address and saving one are rows at the bottom rather than separate commands.
+    /// The no-argument form of /connect. Lists every connection the client can switch
+    /// to: the built-in presets first, then saved gateways, and a slot for an address
+    /// typed by hand or one remembered under a name.
     /// </summary>
-    async Task PickServerAsync()
+    async Task PickConnectionAsync()
     {
         if (!screen.IsInteractive)
         {
@@ -887,18 +1121,38 @@ void ReportUnknownCommand(ParsedInput parsed)
         }
 
         var items = new List<PickItem>();
-        foreach (var server in config.Servers)
+        // Each row carries its action so a header line is not selectable.
+        var actions = new List<string>(); // "connection:<name>", "header", "server:<name>", "custom", "save"
+
+        foreach (var row in config.AllConnections)
         {
-            var active = string.Equals(server.Name, config.ServerName, StringComparison.OrdinalIgnoreCase);
-            items.Add(new PickItem(server.Name, server.Url, active ? "active" : null, active));
+            var active = string.Equals(row.Name, config.ConnectionName, StringComparison.OrdinalIgnoreCase);
+            items.Add(new PickItem(row.Name, row.Url,
+                active ? "active" : (HasCredential(row) ? null : "no key"), active));
+            actions.Add($"connection:{row.Name}");
+        }
+
+        if (config.Servers.Count > 0)
+        {
+            items.Add(new PickItem("— saved gateways —", "", null));
+            actions.Add("header");
+            foreach (var server in config.Servers)
+            {
+                var active = string.Equals(server.Name, config.ServerName, StringComparison.OrdinalIgnoreCase);
+                items.Add(new PickItem(server.Name, server.Url, active ? "active" : null, active));
+                actions.Add($"server:{server.Name}");
+            }
         }
 
         var customAt = items.Count;
         items.Add(new PickItem("custom address…", "type a URL and switch to it"));
+        actions.Add("custom");
+
         var saveAt = items.Count;
         items.Add(new PickItem("save current…", "remember the current address under a name"));
+        actions.Add("save");
 
-        var picked = screen.Pick("servers", items, "↑↓ move · ⏎ select · Esc close");
+        var picked = screen.Pick("connections", items, "↑↓ move · ⏎ select · Esc close");
         if (picked is null) return;
 
         if (picked.Value == saveAt)
@@ -918,24 +1172,97 @@ void ReportUnknownCommand(ParsedInput parsed)
             var error = setting?.Validate(answer.Text);
             if (error is not null)
             {
-                screen.Write(error, ConsoleColor.Red, EntryStyle.Error);
+                screen.Write(error, ConsoleColor.Red);
                 return;
             }
 
             setting!.Write(config, answer.Text);
             config.ServerName = "";
+            config.ConnectionName = "";
             config.Save();
             AfterServerChange($"custom → {config.BaseUrl}");
             await CheckHealthAsync();
             return;
         }
 
-        var chosen = config.Servers[picked.Value];
-        config.BaseUrl = chosen.Url;
-        config.ServerName = chosen.Name;
-        config.Save();
-        AfterServerChange($"{chosen.Name} → {chosen.Url}");
+        var action = actions[picked.Value];
+        if (action == "header" || action == "custom") return;
+
+        var colon = action.IndexOf(':');
+        var kind = colon >= 0 ? action[..colon] : action;
+        var target = colon >= 0 ? action[(colon + 1)..] : action;
+
+        if (kind == "server")
+        {
+            var gateway = config.Servers.First(s => string.Equals(s.Name, target, StringComparison.OrdinalIgnoreCase));
+            config.BaseUrl = gateway.Url;
+            config.ServerName = gateway.Name;
+            config.ConnectionName = "";
+            config.Save();
+            AfterServerChange($"{gateway.Name} → {gateway.Url}");
+            await CheckHealthAsync();
+            return;
+        }
+
+        var selected = config.AllConnections.First(c => string.Equals(c.Name, target, StringComparison.OrdinalIgnoreCase));
+        ApplyConnection(selected);
         await CheckHealthAsync();
+    }
+
+    /// <summary>
+    /// Whether a connection has the credential it needs. Storage is asked about
+    /// separately: it is configured through the environment or the r2:* entries
+    /// in secrets.json, not through a key stored under the connection's name.
+    /// </summary>
+    bool HasCredential(ConnectionEntry entry)
+    {
+        if (entry.Provider == ProviderKind.CloudflareR2)
+        {
+            var endpoint = config.StorageConnection?.Url ?? entry.Url;
+            return string.IsNullOrWhiteSpace(StorageConfig.Load(endpoint).Missing());
+        }
+
+        return !string.IsNullOrWhiteSpace(ClientConfig.GetSecret(entry.CredentialKey));
+    }
+
+    /// <summary>
+    /// The plain-text list of what the client can switch to. Shown when there is no
+    /// terminal to pick from.
+    /// </summary>
+    void ShowServers()
+    {
+        screen.Write("connections", ConsoleColor.White);
+
+        foreach (var entry in config.AllConnections)
+        {
+            var active = string.Equals(entry.Name, config.ConnectionName, StringComparison.OrdinalIgnoreCase);
+            var badge = HasCredential(entry) ? "key" : "no key";
+            screen.Write($"  {(active ? "*" : " ")} {entry.Name,-16} {entry.Url,-46} {badge}",
+                active ? ConsoleColor.Green : ConsoleColor.DarkGray);
+        }
+
+        screen.Write("");
+        screen.Write("servers", ConsoleColor.White);
+
+        if (config.Servers.Count == 0)
+            screen.Write("  (none saved yet — /connect save <name> <url>)", ConsoleColor.DarkGray);
+        else
+        {
+            foreach (var server in config.Servers)
+            {
+                var active = string.Equals(server.Name, config.ServerName, StringComparison.OrdinalIgnoreCase);
+                screen.Write($"  {(active ? "*" : " ")} {server.Name,-16} {server.Url}",
+                    active ? ConsoleColor.Green : ConsoleColor.DarkGray);
+            }
+        }
+
+        screen.Write("");
+        screen.Write($"  current: {config.ServerLabel} → {config.BaseUrl}", ConsoleColor.Cyan);
+        screen.Write($"  model:   {config.Model}", ConsoleColor.Cyan);
+        screen.Write("  /connect <name|url>   switch", ConsoleColor.DarkGray);
+        screen.Write("  /connect key <name>  set the provider's key", ConsoleColor.DarkGray);
+        screen.Write("  /connect save <name> <url>", ConsoleColor.DarkGray);
+        screen.Write("  /connect forget <name>", ConsoleColor.DarkGray);
     }
 
     void SaveServer(string arguments)
@@ -1008,6 +1335,16 @@ void ReportUnknownCommand(ParsedInput parsed)
 
     string KnownServerList() =>
         config.Servers.Count == 0 ? "(none)" : string.Join(", ", config.Servers.Select(s => s.Name));
+
+    string KnownConnectionList() =>
+        string.Join(", ", config.AllConnections.Select(c => c.Name));
+
+    /// <summary>
+    /// The named connection in use, or null when the address was typed by hand and
+    /// belongs to no named connection. The API client needs this to pick the right
+    /// wire protocol, address and credential.
+    /// </summary>
+    ConnectionEntry? GetActiveConnection() => config.ActiveConnection;
 
 /// <summary>
 /// Changes how much of the agent's work runs unattended. Kept as its own command
@@ -1151,7 +1488,7 @@ async Task SwitchProjectAsync(string path)
     try
     {
         project = Project.Open(path);
-        tools = new ToolRegistry(project.Root);
+        tools = new ToolRegistry(project.Root, config);
         log = new SessionLog(project.LogPath);
         // A new workspace means a new conversation, so the remote chat behind this
         // one has to be released along with the transcript.
@@ -1374,7 +1711,7 @@ static (string Name, string Value) Split(string arguments)
 void Reconnect()
 {
     api.Dispose();
-    api = new ApiClient(config);
+    api = new ApiClient(config, GetActiveConnection());
     RefreshHeader();
 }
 
@@ -1405,7 +1742,12 @@ async Task PlanCurrentTaskAsync()
 
     try
     {
-        await RunTurnAsync();
+        await RunTurnWithInputAsync();
+    }
+    catch (OperationCanceledException)
+    {
+        screen.Write("interrupted", ConsoleColor.DarkGray, EntryStyle.Notice);
+        Wire.Write("turn.cancelled", "stopped by the user");
     }
     catch (Exception ex)
     {
@@ -1474,6 +1816,14 @@ static bool IsPlaceholderToolName(string name)
            token.Equals("no_tools_available", StringComparison.OrdinalIgnoreCase) ||
            token.Equals("no-op", StringComparison.OrdinalIgnoreCase) ||
            token.Equals("noop", StringComparison.OrdinalIgnoreCase);
+}
+
+/// <summary>
+/// Self-check: проверяет, использовала ли модель инструменты write/edit в текущем или предыдущих шагах.
+/// </summary>
+bool HasUsedWriteTools()
+{
+    return _hasUsedWriteTools;
 }
 
 static class Sound

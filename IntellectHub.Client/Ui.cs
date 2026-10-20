@@ -59,6 +59,10 @@ public sealed class Ui : IDisposable
     private const int TranscriptLimit = 2000;
 
     private readonly object _gate = new();
+
+    // Console.ReadKey is not reentrant. The turn's own prompts (approval, edit)
+    // and the compose loop both want keys, so exactly one of them may hold this.
+    private readonly object _keyLock = new();
     private readonly List<Entry> _transcript = new();
 
     // Recalled input is kept per prompt. One shared list meant that arrowing up
@@ -66,6 +70,7 @@ public sealed class Ui : IDisposable
     // person editing a setting wants to see.
     private readonly Dictionary<string, List<string>> _historyByPrompt = new();
     private readonly List<string> _tools = new();
+    private int _toolsStamp;
     private readonly CancellationTokenSource _cts = new();
     private readonly bool _interactive;
     private readonly bool _controlCAsInput;
@@ -88,6 +93,16 @@ public sealed class Ui : IDisposable
     private int _liveIndex = -1;
     private bool _busy;
     private bool _disposed;
+    private bool _approvalActive;
+
+    // Wrapping the whole transcript on every frame is what made long sessions
+    // stutter. Lines before the entry that is currently streaming never change,
+    // so they are wrapped once and reused until the width or a line changes.
+    private int _flatStamp;
+    private int _flatStampSeen = -1;
+    private int _flatWidth = -1;
+    private int _flatCount;
+    private readonly List<Entry> _flatHead = new();
 
     private bool _sidebar = true;
     private bool _toolDetails = true;
@@ -100,6 +115,37 @@ public sealed class Ui : IDisposable
     private string _approvals = "";
 
     private sealed record Entry(string Text, Color Color, EntryStyle Style, int Indent, bool Head);
+
+    /// <summary>
+    /// Everything the frame shows, in a form that is cheap to compare. The render
+    /// loop repaints only when this changes (or while busy, to turn the spinner),
+    /// instead of rewriting the same screen fourteen times a second.
+    /// </summary>
+    private readonly record struct RenderState(
+        int Count,
+        int LastLength,
+        int Stamp,
+        int Live,
+        string Input,
+        int Cursor,
+        string Prompt,
+        bool Approval,
+        string Status,
+        bool Busy,
+        int Scroll,
+        object? Overlay,
+        string OverlayHint,
+        bool Details,
+        bool Sidebar,
+        string Approvals,
+        string Model,
+        string Server,
+        string Project,
+        int Messages,
+        int Tokens,
+        int Tools,
+        int ToolsStamp,
+        object? Header);
 
     public Ui()
     {
@@ -134,6 +180,7 @@ public sealed class Ui : IDisposable
         {
             _tools.Clear();
             _tools.AddRange(tools);
+            _toolsStamp++;
         }
     }
 
@@ -170,6 +217,7 @@ public sealed class Ui : IDisposable
                 _transcript.Add(new Entry(line, tint, style, indent, head));
                 head = false;
             }
+            _flatStamp++;
             if (_transcript.Count > TranscriptLimit)
                 _transcript.RemoveRange(0, _transcript.Count - TranscriptLimit);
             _scrollFromBottom = 0;
@@ -185,6 +233,7 @@ public sealed class Ui : IDisposable
         {
             _transcript.Add(new Entry("", ToColor(color), style, IndentFor(style), true));
             _liveIndex = _transcript.Count - 1;
+            _flatStamp++;
             _scrollFromBottom = 0;
         }
     }
@@ -214,6 +263,7 @@ public sealed class Ui : IDisposable
         {
             _transcript.Clear();
             _liveIndex = -1;
+            _flatStamp++;
             _scrollFromBottom = 0;
         }
         if (!_interactive)
@@ -255,6 +305,12 @@ public sealed class Ui : IDisposable
             return line is null ? PromptResult.Exit : new PromptResult(line);
         }
 
+        // While a turn runs, its approval and edit prompts live on another task.
+        // The compose loop must not steal their keystrokes, so whoever is reading
+        // holds this lock for the whole prompt.
+        Monitor.Enter(_keyLock);
+        try
+        {
         lock (_gate)
         {
             _prompt = prompt ?? "";
@@ -435,6 +491,11 @@ public sealed class Ui : IDisposable
                     break;
             }
         }
+        }
+        finally
+        {
+            Monitor.Exit(_keyLock);
+        }
     }
 
     /// <summary>
@@ -563,7 +624,7 @@ public sealed class Ui : IDisposable
     {
         var rows = new List<IRenderable>();
         var width = ContentWidth();
-        var visible = Math.Max(4, SafeWindowHeight() - HeaderHeight - FooterHeight - 8);
+        var visible = Math.Max(4, BodyHeight() - 8);
         var start = 0;
         if (matches.Count > visible)
             start = Math.Clamp(position - visible / 2, 0, matches.Count - visible);
@@ -682,9 +743,15 @@ public sealed class Ui : IDisposable
 
     private static int PageSize()
     {
-        var size = SafeWindowHeight() - HeaderHeight - FooterHeight - 2;
+        // One row is deliberately left unused at the bottom. A frame that exactly
+        // fills the window makes the terminal scroll by a line on every repaint,
+        // which is what looked like the whole screen jumping.
+        var size = BodyHeight() - 2;
         return Math.Max(3, size);
     }
+
+    private static int BodyHeight() =>
+        Math.Max(12, SafeWindowHeight() - HeaderHeight - FooterHeight - 1);
 
     public BarrierChoice Ask(string thought, string action)
     {
@@ -700,7 +767,13 @@ public sealed class Ui : IDisposable
 
         if (!_interactive) return BarrierChoice.Run;
 
-        lock (_gate) _status = "awaiting your approval";
+        Monitor.Enter(_keyLock);
+        lock (_gate)
+        {
+            _status = "awaiting your approval";
+            _approvalActive = true;
+        }
+
         try
         {
             while (true)
@@ -722,8 +795,220 @@ public sealed class Ui : IDisposable
         }
         finally
         {
-            lock (_gate) _status = "ready";
+            lock (_gate)
+            {
+                _approvalActive = false;
+                _status = "working";
+            }
+            Monitor.Exit(_keyLock);
         }
+    }
+
+    /// <summary>
+    /// Blocks the compose loop from taking keys while the turn runs its own
+    /// blocking prompt (the edit form after an approval).
+    /// </summary>
+    public void HoldKeyboard()
+    {
+        lock (_gate) _approvalActive = true;
+    }
+
+    public void ReleaseKeyboard()
+    {
+        lock (_gate) _approvalActive = false;
+    }
+
+    /// <summary>
+    /// Keeps the prompt editable while a turn is in flight. Enter queues the line
+    /// instead of sending it into the running turn; Esc (on an empty line) asks the
+    /// turn to stop. Tools that ask for approval or open an edit prompt take the
+    /// keyboard for themselves, exactly as they do when the client is idle.
+    /// </summary>
+    public IReadOnlyList<string> ComposeWhileBusy(Task work, CancellationTokenSource cancel)
+    {
+        var queued = new List<string>();
+        if (!_interactive) return queued;
+
+        lock (_gate)
+        {
+            _prompt = "";
+            _scrollFromBottom = 0;
+        }
+
+        while (!work.IsCompleted)
+        {
+            var handled = false;
+            try
+            {
+                lock (_keyLock)
+                {
+                    // A turn-side prompt is reading keys; leave them alone.
+                    if (_approvalActive)
+                    {
+                        // fall through to the short sleep
+                    }
+                    else if (Console.KeyAvailable)
+                    {
+                        var key = Console.ReadKey(intercept: true);
+                        handled = true;
+                        if (HandleBusyKey(key, queued) && !cancel.IsCancellationRequested)
+                        {
+                            cancel.Cancel();
+                            lock (_gate) _status = "stopping";
+                        }
+                    }
+                    else if (_prompt.Length > 0)
+                    {
+                        _prompt = "";
+                    }
+                }
+            }
+            catch (InvalidOperationException)
+            {
+                break;
+            }
+
+            if (!handled) Thread.Sleep(18);
+        }
+
+        return queued;
+    }
+
+    /// <summary>Returns true when the key asks the running turn to stop.</summary>
+    private bool HandleBusyKey(ConsoleKeyInfo key, List<string> queued)
+    {
+        var ctrl = key.Modifiers.HasFlag(ConsoleModifiers.Control);
+
+        switch (key.Key)
+        {
+            case ConsoleKey.Enter:
+                lock (_gate)
+                {
+                    var text = _input.Trim();
+                    if (text.Length > 0)
+                    {
+                        var history = HistoryFor("");
+                        if (history.Count == 0 || history[^1] != text) history.Add(text);
+                        _histCursor = history.Count;
+                        queued.Add(text);
+                    }
+                    _input = "";
+                    _cursor = 0;
+                }
+                return false;
+
+            case ConsoleKey.Backspace:
+                lock (_gate)
+                {
+                    if (_cursor > 0)
+                    {
+                        _input = _input.Remove(_cursor - 1, 1);
+                        _cursor--;
+                    }
+                }
+                return false;
+
+            case ConsoleKey.Delete:
+                lock (_gate)
+                {
+                    if (_cursor < _input.Length) _input = _input.Remove(_cursor, 1);
+                }
+                return false;
+
+            case ConsoleKey.LeftArrow:
+                if (ctrl) MoveCursor(WordLeft(_input, _cursor));
+                else MoveCursor(_cursor - 1);
+                return false;
+
+            case ConsoleKey.RightArrow:
+                if (ctrl) MoveCursor(WordRight(_input, _cursor));
+                else MoveCursor(_cursor + 1);
+                return false;
+
+            case ConsoleKey.UpArrow:
+                Navigate(-1);
+                return false;
+
+            case ConsoleKey.DownArrow:
+                Navigate(1);
+                return false;
+
+            case ConsoleKey.PageUp:
+                Scroll(PageSize());
+                return false;
+
+            case ConsoleKey.PageDown:
+                Scroll(-PageSize());
+                return false;
+
+            case ConsoleKey.Home:
+                if (ctrl) Scroll(int.MaxValue);
+                else MoveCursor(0);
+                return false;
+
+            case ConsoleKey.End:
+                if (ctrl) Scroll(int.MinValue);
+                else MoveCursor(_input.Length);
+                return false;
+
+            case ConsoleKey.Tab:
+                Complete();
+                return false;
+
+            case ConsoleKey.Escape:
+                // First press clears what was typed, the second stops the turn.
+                lock (_gate)
+                {
+                    if (_input.Length > 0)
+                    {
+                        _input = "";
+                        _cursor = 0;
+                        return false;
+                    }
+                }
+                return true;
+
+            case ConsoleKey.C when ctrl:
+                lock (_gate)
+                {
+                    if (_input.Length > 0)
+                    {
+                        _input = "";
+                        _cursor = 0;
+                        return false;
+                    }
+                }
+                return true;
+
+            case ConsoleKey.A when ctrl: MoveCursor(0); return false;
+            case ConsoleKey.E when ctrl: MoveCursor(_input.Length); return false;
+            case ConsoleKey.U when ctrl:
+                lock (_gate)
+                {
+                    _input = _input[Math.Clamp(_cursor, 0, _input.Length)..];
+                    _cursor = 0;
+                }
+                return false;
+
+            case ConsoleKey.W when ctrl:
+                lock (_gate)
+                {
+                    var from = WordLeft(_input, _cursor);
+                    _input = _input.Remove(from, Math.Max(0, _cursor - from));
+                    _cursor = from;
+                }
+                return false;
+        }
+
+        if (!char.IsControl(key.KeyChar))
+            lock (_gate)
+            {
+                _cursor = Math.Clamp(_cursor, 0, _input.Length);
+                _input = _input.Insert(_cursor, key.KeyChar.ToString());
+                _cursor++;
+            };
+
+        return false;
     }
 
     private void RenderLoop(CancellationToken token)
@@ -737,37 +1022,86 @@ public sealed class Ui : IDisposable
                 _layout = initial;
                 _layoutSidebar = _sidebar;
 
+                var painted = false;
+                var last = default(RenderState);
+                var lastPaint = 0L;
+
                 while (!token.IsCancellationRequested)
                 {
-                    try
+                    RenderState state;
+                    lock (_gate) state = SnapshotLocked();
+
+                    var now = Environment.TickCount64;
+                    var busy = state.Busy;
+                    var changed = !painted || !state.Equals(last);
+
+                    // Streaming text changes the state on every chunk. Redrawing on
+                    // each one is what made long answers shake; cap it while busy and
+                    // let the spinner own the frame when nothing else moved.
+                    var due = !busy || now - lastPaint >= 60;
+                    var animate = busy && now - lastPaint >= 90;
+
+                    if ((changed && due) || animate)
                     {
-                        lock (_gate)
+                        try
                         {
-                            if (_busy) _frame++;
-
-                            if (_layoutSidebar != _sidebar || _layout is null)
+                            lock (_gate)
                             {
-                                _layout = BuildLayout(_sidebar);
-                                _layoutSidebar = _sidebar;
-                                ctx.UpdateTarget(_layout);
+                                if (_busy) _frame++;
+
+                                if (_layoutSidebar != _sidebar || _layout is null)
+                                {
+                                    _layout = BuildLayout(_sidebar);
+                                    _layoutSidebar = _sidebar;
+                                    ctx.UpdateTarget(_layout);
+                                }
+
+                                _layout["header"].Update(_header ?? new Text(""));
+                                if (_sidebar) _layout["sidebar"].Update(BuildSidebar());
+                                ContentTarget(_layout).Update(BuildContent());
+                                _layout["footer"].Update(BuildFooter());
                             }
-
-                            _layout["header"].Update(_header ?? new Text(""));
-                            if (_sidebar) _layout["sidebar"].Update(BuildSidebar());
-                            ContentTarget(_layout).Update(BuildContent());
-                            _layout["footer"].Update(BuildFooter());
+                            ctx.Refresh();
+                            last = state;
+                            lastPaint = now;
+                            painted = true;
                         }
-                        ctx.Refresh();
-                    }
-                    catch
-                    {
-                        // a resize or a transient console error must not tear down the UI
+                        catch
+                        {
+                            // a resize or a transient console error must not tear down the UI
+                        }
                     }
 
-                    Thread.Sleep(70);
+                    Thread.Sleep(busy ? 20 : 40);
                 }
             });
     }
+
+    private RenderState SnapshotLocked() => new(
+        _transcript.Count,
+        _transcript.Count > 0 ? _transcript[^1].Text.Length : 0,
+        _flatStamp,
+        _liveIndex,
+        _input,
+        _cursor,
+        _prompt,
+        _approvalActive,
+        _status,
+        _busy,
+        _scrollFromBottom,
+        _overlay,
+        _overlayHint,
+        _toolDetails,
+        _sidebar,
+        _approvals,
+        _model,
+        _server,
+        _project,
+        _messages,
+        _approxTokens,
+        _tools.Count,
+        _toolsStamp,
+        _header);
 
     private static Layout BuildLayout(bool sidebar)
     {
@@ -788,7 +1122,7 @@ public sealed class Ui : IDisposable
     private IRenderable BuildSidebar()
     {
         var rows = new List<IRenderable>();
-        var inner = Math.Max(8, SafeWindowHeight() - HeaderHeight - FooterHeight - 2);
+        var inner = Math.Max(8, BodyHeight() - 2);
 
         void Section(string name)
         {
@@ -851,7 +1185,7 @@ public sealed class Ui : IDisposable
     {
         if (_overlay is not null) return _overlay;
 
-        var room = PageSize();
+        var room = Math.Max(1, PageSize() - 1); // one row is the leading blank line
         var lines = FlattenLocked();
         var end = Math.Max(0, lines.Count - _scrollFromBottom);
         var start = Math.Max(0, end - room);
@@ -915,29 +1249,52 @@ public sealed class Ui : IDisposable
     private List<Entry> FlattenLocked()
     {
         var width = ContentWidth();
-        var flat = new List<Entry>();
-        foreach (var entry in _transcript)
-        {
-            if (entry.Text.Length == 0)
-            {
-                flat.Add(entry);
-                continue;
-            }
 
-            var room = Math.Max(12, width - entry.Indent);
-            var remaining = entry.Text;
-            var head = true;
-            while (remaining.Length > room)
-            {
-                var cut = remaining.LastIndexOf(' ', Math.Min(room, remaining.Length - 1));
-                if (cut <= 0) cut = room;
-                flat.Add(entry with { Text = remaining[..cut], Head = head });
-                remaining = remaining[cut..].TrimStart(' ');
-                head = false;
-            }
-            flat.Add(entry with { Text = remaining, Head = head });
+        if (_flatWidth != width || _flatStampSeen != _flatStamp || _flatCount > _transcript.Count)
+        {
+            _flatHead.Clear();
+            _flatCount = 0;
+            _flatWidth = width;
+            _flatStampSeen = _flatStamp;
         }
+
+        // Everything before the entry that is still receiving text is immutable.
+        var stableEnd = _transcript.Count;
+        if (_liveIndex == _transcript.Count - 1 && _liveIndex >= _flatCount)
+            stableEnd = _liveIndex;
+
+        for (var i = _flatCount; i < stableEnd; i++)
+            WrapInto(_transcript[i], width, _flatHead);
+        _flatCount = stableEnd;
+
+        if (stableEnd == _transcript.Count) return _flatHead;
+
+        var flat = new List<Entry>(_flatHead);
+        for (var i = stableEnd; i < _transcript.Count; i++)
+            WrapInto(_transcript[i], width, flat);
         return flat;
+    }
+
+    private static void WrapInto(Entry entry, int width, List<Entry> flat)
+    {
+        if (entry.Text.Length == 0)
+        {
+            flat.Add(entry);
+            return;
+        }
+
+        var room = Math.Max(12, width - entry.Indent);
+        var remaining = entry.Text;
+        var head = true;
+        while (remaining.Length > room)
+        {
+            var cut = remaining.LastIndexOf(' ', Math.Min(room, remaining.Length - 1));
+            if (cut <= 0) cut = room;
+            flat.Add(entry with { Text = remaining[..cut], Head = head });
+            remaining = remaining[cut..].TrimStart(' ');
+            head = false;
+        }
+        flat.Add(entry with { Text = remaining, Head = head });
     }
 
     private int ContentWidth()
@@ -970,7 +1327,9 @@ public sealed class Ui : IDisposable
         var label = _prompt.Length > 0 ? $"[grey]{Markup.Escape(_prompt)}[/] " : "";
 
         var placeholder = text.Length == 0
-            ? "[grey]Ask anything… (/ for commands)[/]"
+            ? _busy
+                ? "[grey]type a follow-up… (⏎ queues it)[/]"
+                : "[grey]Ask anything… (/ for commands)[/]"
             : "";
 
         var inputLine = new Markup(
@@ -997,6 +1356,17 @@ public sealed class Ui : IDisposable
     private string HintLine()
     {
         if (_overlay is not null) return $"[grey]{Markup.Escape(_overlayHint)}[/]";
+
+        if (_approvalActive)
+            return "[grey]⏎ run · s step · e edit · q stop[/]";
+
+        if (_busy && _prompt.Length > 0)
+            return "[grey]⏎ accept · Esc cancel[/]";
+
+        if (_busy)
+            return _input.Length > 0
+                ? "[grey]⏎ queue for after this turn · Esc clear · ⌃C clear[/]"
+                : "[grey]type to queue · Esc stop · ⌃C stop[/]";
 
         if (_input.Length == 0)
             return "[grey]⏎ send · ⇧⇥ approvals · ⌃K commands · ⌃O settings · ⌃L clear · F1 help[/]";

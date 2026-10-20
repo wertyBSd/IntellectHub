@@ -39,29 +39,88 @@ public sealed class ApiClient : IDisposable
 {
     private readonly HttpClient _http;
     private readonly ClientConfig _config;
+    private readonly ConnectionEntry? _connection;
+    private readonly ProviderKind _provider;
+    private readonly string _model;
 
-    public ApiClient(ClientConfig config)
+    public ApiClient(ClientConfig config, ConnectionEntry? connection = null)
     {
         _config = config;
+        _connection = connection;
+        _provider = connection?.Provider ?? ProviderKind.Anthropic;
+
+        // A named connection carries its own address; otherwise the address comes
+        // from the configuration, which is what a hand-typed gateway looks like.
+        var baseUrl = string.IsNullOrWhiteSpace(connection?.Url) ? config.BaseUrl : connection.Url;
+
+        // The model follows the connection when it names one, so switching provider
+        // does not leave the previous provider's model behind.
+        _model = !string.IsNullOrWhiteSpace(connection?.Model) ? connection.Model : config.Model;
+
         _http = new HttpClient
         {
-            BaseAddress = new Uri(config.BaseUrl.TrimEnd('/') + "/"),
+            BaseAddress = new Uri(baseUrl.TrimEnd('/') + "/"),
             Timeout = TimeSpan.FromMinutes(5),
         };
-        if (!string.IsNullOrWhiteSpace(config.ApiKey))
-        {
-            _http.DefaultRequestHeaders.TryAddWithoutValidation("Authorization", "Bearer " + config.ApiKey);
-            _http.DefaultRequestHeaders.TryAddWithoutValidation("x-api-key", config.ApiKey);
-        }
+
+        // A named connection keeps its credential in secrets.json under its own
+        // key, so two providers can be signed in at the same time. The gateway
+        // key in client.json stays the fallback for hand-typed addresses.
+        EffectiveKey = connection is null
+            ? config.ApiKey
+            : ClientConfig.GetSecret(connection.CredentialKey) ?? config.ApiKey;
+
+        ApplyAuth(baseUrl);
 
         Wire.TraceId = null;
-        Wire.Write("client.init", "base_url={0} · model={1} · max_tokens={2} · temperature={3} · api_key={4} · timeout=300s",
-            config.BaseUrl.TrimEnd('/') + "/",
-            config.Model,
+        Wire.Write("client.init", "base_url={0} · model={1} · max_tokens={2} · temperature={3} · provider={4} · api_key={5} · timeout=300s",
+            baseUrl.TrimEnd('/') + "/",
+            _model,
             config.MaxTokens,
             config.Temperature,
-            string.IsNullOrWhiteSpace(config.ApiKey) ? "(none)" : Wire.Mask(config.ApiKey));
+            _provider,
+            string.IsNullOrWhiteSpace(EffectiveKey) ? "(none)" : Wire.Mask(EffectiveKey));
         Wire.Write("client.init", "trace file → {0}", Wire.LogDirectory);
+    }
+
+    /// <summary>The credential in use, from secrets.json or the configuration.</summary>
+    private string? EffectiveKey { get; set; }
+
+    /// <summary>
+    /// Sends the credential the way the provider expects it. Each provider family
+    /// reads the key from a different header, and a key sent in the wrong one is
+    /// either ignored or rejected as a malformed request.
+    /// </summary>
+    private void ApplyAuth(string baseUrl)
+    {
+        var key = EffectiveKey;
+        if (string.IsNullOrWhiteSpace(key)) return;
+
+        switch (_connection?.Auth ?? AuthStyle.Bearer)
+        {
+            case AuthStyle.AnthropicKey:
+                _http.DefaultRequestHeaders.TryAddWithoutValidation("x-api-key", key);
+                _http.DefaultRequestHeaders.TryAddWithoutValidation("anthropic-version", "2023-06-01");
+                break;
+
+            case AuthStyle.GoogleApiKey:
+                _http.DefaultRequestHeaders.TryAddWithoutValidation("x-goog-api-key", key);
+                break;
+
+            case AuthStyle.Bearer:
+                _http.DefaultRequestHeaders.TryAddWithoutValidation("Authorization", "Bearer " + key);
+                break;
+
+            case AuthStyle.None:
+                break;
+        }
+
+        // Provider-specific headers from the preset (OpenRouter's referrer, etc.).
+        if (_connection is not null)
+        {
+            foreach (var (name, value) in _connection.Headers)
+                _http.DefaultRequestHeaders.TryAddWithoutValidation(name, value);
+        }
     }
 
     public async Task<string> HealthAsync(CancellationToken ct = default)
@@ -122,11 +181,15 @@ public sealed class ApiClient : IDisposable
 
         var payload = new JsonObject
         {
-            ["model"] = _config.Model,
+            ["model"] = _model,
             ["max_tokens"] = _config.MaxTokens,
             ["temperature"] = _config.Temperature,
-            ["system"] = _config.System,
         };
+
+        if (_provider == ProviderKind.Anthropic)
+        {
+            payload["system"] = _config.System;
+        }
 
         var messageArray = new JsonArray();
         foreach (var message in messages)
@@ -157,11 +220,12 @@ public sealed class ApiClient : IDisposable
         var json = payload.ToJsonString();
         var clock = System.Diagnostics.Stopwatch.StartNew();
 
-        Wire.Write("http.req", "POST v1/messages → {0} · history={1} msgs · tools={2} · {3} bytes",
-            _http.BaseAddress, messages.Count, tools?.Count ?? 0, json.Length);
+        var endpoint = _provider == ProviderKind.Anthropic ? "v1/messages" : "v1/chat/completions";
+        Wire.Write("http.req", "POST {0} → {1} · history={2} msgs · tools={3} · {4} bytes",
+            endpoint, _http.BaseAddress, messages.Count, tools?.Count ?? 0, json.Length);
         Wire.Json("http.req.body", json);
 
-        using var request = new HttpRequestMessage(HttpMethod.Post, "v1/messages")
+        using var request = new HttpRequestMessage(HttpMethod.Post, endpoint)
         {
             Content = new StringContent(json, Encoding.UTF8, "application/json"),
         };
@@ -203,6 +267,7 @@ public sealed class ApiClient : IDisposable
         var text = new StringBuilder();
         var calls = new List<ToolCall>();
 
+        // Anthropic: content array with type text/tool_use
         if (root.TryGetProperty("content", out var content) && content.ValueKind == JsonValueKind.Array)
         {
             foreach (var block in content.EnumerateArray())
@@ -218,6 +283,33 @@ public sealed class ApiClient : IDisposable
                     var name = block.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "";
                     var input = block.TryGetProperty("input", out var inp) ? inp.GetRawText() : "{}";
                     calls.Add(new ToolCall { Id = id, Name = name, Arguments = input });
+                }
+            }
+        }
+        // OpenAI: choices[0].message.content + tool_calls
+        else if (root.TryGetProperty("choices", out var choices) && choices.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var choice in choices.EnumerateArray())
+            {
+                if (choice.TryGetProperty("message", out var message))
+                {
+                    if (message.TryGetProperty("content", out var msgContent) && msgContent.ValueKind == JsonValueKind.String)
+                        text.Append(msgContent.GetString());
+
+                    if (message.TryGetProperty("tool_calls", out var toolCalls) && toolCalls.ValueKind == JsonValueKind.Array)
+                    {
+                        foreach (var tc in toolCalls.EnumerateArray())
+                        {
+                            var id = tc.TryGetProperty("id", out var tci) ? tci.GetString() ?? "" : "";
+                            // JsonElement is a struct, so the absence of the property has
+                            // to be spelled as a nullable or the two arms of the
+                            // conditional disagree on their type.
+                            JsonElement? func = tc.TryGetProperty("function", out var f) ? f : null;
+                            var name = func is not null && func.Value.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "";
+                            var args = func is not null && func.Value.TryGetProperty("arguments", out var a) ? a.GetRawText() : "{}";
+                            calls.Add(new ToolCall { Id = id, Name = name, Arguments = args });
+                        }
+                    }
                 }
             }
         }

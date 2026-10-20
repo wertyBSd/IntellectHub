@@ -75,7 +75,7 @@ internal static class CommandLine
         new("/help",     "/help",              "show this help", ["/h", "/?"]),
         new("/models",   "/models",            "choose a model from the server's list"),
         new("/config",   "/config [name] [value]", "settings menu; edit without typing a value", ["/cfg", "/settings"]),
-        new("/connect",  "/connect [name|url|save|forget]", "switch gateway from the saved list or a URL", ["/server", "/url"]),
+        new("/connect",  "/connect [name|url|key|save|forget|add]", "switch provider; name a preset, save a URL or store the provider's key", ["/server", "/url", "/key"]),
         new("/approve",  "/approve [ask|writes|all]", "what runs without asking; Shift+Tab cycles", ["/approvals"]),
         new("/project",  "/project [path]",    "switch workspace from recent folders", ["/cd"]),
         new("/clear",    "/clear",             "clear the conversation", ["/reset"]),
