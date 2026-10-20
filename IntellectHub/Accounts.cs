@@ -20,18 +20,51 @@ internal sealed class Account
     public required string File { get; set; }
     public required AccountConfig Config { get; set; }
 
-    public long CooldownUntil;
-    public string? CooldownReason;
-    public int Failures;
-    public int TotalFailures;
-    public string? LastError;
-    public long LastSuccessAt;
-    public long LastUsedAt;
-    public bool AdminDisabled;
+    public long CooldownUntil { get; private set; }
+    public string? CooldownReason { get; private set; }
+    public int Failures { get; private set; }
+    public int TotalFailures { get; private set; }
+    public string? LastError { get; private set; }
+    public long LastSuccessAt { get; private set; }
+    public long LastUsedAt { get; private set; }
+    public bool AdminDisabled { get; private set; }
 
     public bool HasCredentials => !string.IsNullOrEmpty(Config.Token) && !string.IsNullOrEmpty(Config.Cookie);
     public bool Enabled => Config.Enabled != false && !AdminDisabled;
     public bool CanServe(long now) => HasCredentials && Enabled && CooldownUntil <= now;
+
+    public void MarkCooldown(long until, string? reason)
+    {
+        CooldownUntil = until;
+        CooldownReason = reason;
+    }
+
+    public void MarkFailure(string error)
+    {
+        Failures++;
+        TotalFailures++;
+        LastError = error;
+    }
+
+    public void MarkSuccess(long timestamp)
+    {
+        Failures = 0;
+        LastSuccessAt = timestamp;
+        LastUsedAt = timestamp;
+    }
+
+    public void MarkAdminDisabled(bool disabled)
+    {
+        AdminDisabled = disabled;
+    }
+
+    public void ResetState()
+    {
+        CooldownUntil = 0;
+        CooldownReason = null;
+        Failures = 0;
+        LastError = null;
+    }
 }
 
 internal sealed class AccountsFile
@@ -156,10 +189,7 @@ internal sealed class AccountPool
                     prev.Config = config;
                     if (changed)
                     {
-                        prev.CooldownUntil = 0;
-                        prev.CooldownReason = null;
-                        prev.Failures = 0;
-                        prev.LastError = null;
+                        prev.ResetState();
                         relogged.Add(prev.Id);
                     }
                     result.Add(prev);
@@ -228,8 +258,8 @@ internal sealed class AccountPool
         {
             // Never shorten a cooldown that is already running: a late in-flight
             // response must not undo a penalty another request already paid.
-            account.CooldownUntil = Math.Max(account.CooldownUntil, Now() + ms);
-            account.CooldownReason = "rate_limit";
+            var until = Math.Max(account.CooldownUntil, Now() + ms);
+            account.MarkCooldown(until, "rate_limit");
         }
     }
 
@@ -237,8 +267,8 @@ internal sealed class AccountPool
     {
         lock (_gate)
         {
-            account.CooldownUntil = Math.Max(account.CooldownUntil, Now() + CooldownMs);
-            account.CooldownReason = "auth";
+            var until = Math.Max(account.CooldownUntil, Now() + CooldownMs);
+            account.MarkCooldown(until, "auth");
         }
     }
 
@@ -248,9 +278,7 @@ internal sealed class AccountPool
         {
             // The cooldown is deliberately left alone: a late reply from a request
             // that started before the penalty must not erase that penalty.
-            account.Failures = 0;
-            account.LastSuccessAt = Now();
-            account.LastUsedAt = Now();
+            account.MarkSuccess(Now());
         }
     }
 

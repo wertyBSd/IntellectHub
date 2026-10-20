@@ -1,3 +1,6 @@
+using System.Text.Json;
+using System.Text.RegularExpressions;
+
 namespace IntellectHub;
 
 /// <summary>
@@ -18,6 +21,10 @@ internal sealed class CompletionResult
 
 internal sealed class ChatCompletionService
 {
+    // Backoff tuning for retry attempts.
+    private const int BackoffBaseMs = 500;
+    private const int BackoffMaxMs = 1500;
+
     private readonly AccountPool _pool;
     private readonly IDeepSeekCompletion _client;
     private readonly AppConfig _config;
@@ -71,6 +78,15 @@ internal sealed class ChatCompletionService
             upstream = await ContinueAsync(prepared, request, upstream, trace, ct);
 
             var resolution = Resolve(prepared, upstream, trace);
+
+            // Native DeepSeek tools (web_search, execute_code, …) cannot be run by
+            // this gateway. Ignore the call and deliver the text answer as-is — the
+            // model adapts and continues in plain text, exactly like Cline expects.
+            if (resolution.NativeTool is not null)
+            {
+                AppLog.Info($"{trace} ignored native DeepSeek tool '{resolution.NativeTool}' · delivering text answer");
+            }
+
             if (resolution.RetryPrompt is null)
             {
                 AppLog.Ok($"{trace} итог · {Summarize(resolution.Result!)} · {clock.ElapsedMilliseconds} мс");
@@ -145,6 +161,9 @@ internal sealed class ChatCompletionService
     internal sealed record Resolution(CompletionResult? Result, string? RetryPrompt)
     {
         public bool Unusable => Result is null && RetryPrompt is null;
+
+        /// <summary>Set when the model called a native DeepSeek tool the gateway cannot run.</summary>
+        public string? NativeTool { get; init; }
     }
 
     internal static Prepared Prepare(ChatCompletionRequest request, AppConfig config, int startIndex = 0)
@@ -160,11 +179,12 @@ internal sealed class ChatCompletionService
         // model learns that gateway tools exist. Both it and the reminder are
         // reserved before the conversation is given a budget: a manifest cut in
         // half silently removes the model's ability to call anything.
+        var searchEnabled = ModelRegistry.Resolve(request.Model).SearchEnabled;
         var reserved = tools.Count > 0
             ? new List<string?>
             {
-                ToolPrompts.FormatToolDefinitions(tools, config.MaxPromptChars),
-                ToolPrompts.FormatToolReminder(tools),
+                ToolPrompts.FormatToolDefinitions(tools, config.MaxPromptChars, searchEnabled),
+                ToolPrompts.FormatToolReminder(tools, searchEnabled),
             }
             : [];
 
@@ -231,12 +251,24 @@ internal sealed class ChatCompletionService
                          ?? mentioned.FirstOrDefault(name => ToolCallParser.IsDeepSeekNativeTool(name))
                          ?? NativeToolName(dsmlCalls);
 
-        var shouldRepairNative = selected is null && nativeName is not null;
+        var allPlaceholders = ToolCallParser.AllPlaceholderToolCalls(content);
+        var shouldRepairNative = selected is null && nativeName is not null && !allPlaceholders;
         var shouldRepairMarkup = selected is null && !shouldRepairNative &&
-                                 ToolCallParser.LooksLikeToolCallMarkup(content);
+                                 ToolCallParser.LooksLikeToolCallMarkup(content) && !allPlaceholders;
         var shouldRepairCodeDump = allowed.Count > 0 && selected is null && !shouldRepairMarkup &&
                                   !shouldRepairNative &&
-                                  ToolCallParser.LooksLikeCodeDumpInsteadOfTool(content);
+                                  ToolCallParser.LooksLikeCodeDumpInsteadOfTool(content) && !allPlaceholders;
+
+        // If the response was truncated but has tool markup, try to extract a partial tool call
+        if (selected is null && upstream.FinishReason is "length" or "INCOMPLETE")
+        {
+            var partialCalls = ToolCallParser.TryExtractTruncatedToolCall(content, allowed);
+            if (partialCalls is { Count: > 0 })
+            {
+                AppLog.Warn($"{trace} ответ обрезан ({upstream.FinishReason}), извлечён частичный tool-call: {partialCalls[0].Name}");
+                return new Resolution(ToResult(prepared, upstream, "tool_calls", partialCalls), null);
+            }
+        }
 
         if (shouldRepairNative || shouldRepairMarkup || shouldRepairCodeDump)
         {
@@ -256,11 +288,15 @@ internal sealed class ChatCompletionService
                 why, string.Join(", ", allowed), nativeName ?? "-", string.Join(", ", mentioned));
             Wire.Block("resolve.repair.src", content);
 
-            return new Resolution(null, retryPrompt);
+            return new Resolution(null, retryPrompt) { NativeTool = nativeName };
         }
 
-        Wire.Write("resolve.text", "no tool call · {0} chars delivered as answer", upstream.Content.Length);
-        return new Resolution(ToResult(prepared, upstream, upstream.FinishReason, []), null);
+        var resolvedContent = allPlaceholders
+            ? ToolCallParser.StripToolCallMarkup(upstream.Content)
+            : upstream.Content;
+
+        Wire.Write("resolve.text", "no tool call · {0} chars delivered as answer", resolvedContent.Length);
+        return new Resolution(ToResult(prepared, upstream with { Content = resolvedContent }, upstream.FinishReason, []), null);
     }
 
     /// <summary>
@@ -276,26 +312,56 @@ internal sealed class ChatCompletionService
         if (retryCalls.Count > 0)
             return new Resolution(ToResult(prepared, retry, "tool_calls", retryCalls), null);
 
+        // Strip placeholder tool-call markup so raw DSML/JSON never leaks to the client.
+        var cleanRetry = retry with { Content = ToolCallParser.StripToolCallMarkup(retry.Content) };
+
         if (prepared.AllowedNames.Count > 0)
         {
             // The client has tools, so a call to one of them is a real answer.
-            var retrySelected = ToolCallParser.SelectAgentToolCall(retry.Content, prepared.AllowedNames);
+            var retrySelected = ToolCallParser.SelectAgentToolCall(cleanRetry.Content, prepared.AllowedNames);
             if (retrySelected is not null && prepared.AllowedNames.Contains(retrySelected.Name))
-                return new Resolution(ToResult(prepared, retry, "tool_calls", [retrySelected]), null);
+                return new Resolution(ToResult(prepared, cleanRetry, "tool_calls", [retrySelected]), null);
 
-            if (!ToolCallParser.LooksLikeToolCallMarkup(retry.Content))
-                return new Resolution(ToResult(prepared, retry, retry.FinishReason, []), null);
+            if (!ToolCallParser.LooksLikeToolCallMarkup(cleanRetry.Content))
+                return new Resolution(ToResult(prepared, cleanRetry, cleanRetry.FinishReason, []), null);
 
-            return new Resolution(null, null);
+            // Markup remains but nothing the client can execute. If every call is a
+            // placeholder name (no_tool_available etc.), deliver the text as a plain
+            // answer instead of failing with HTTP 502.
+            if (ToolCallParser.AllPlaceholderToolCalls(cleanRetry.Content))
+                return new Resolution(ToResult(prepared, cleanRetry, cleanRetry.FinishReason, []), null);
+
+            // If it is a native DeepSeek tool (web_search, execute_code, …) the
+            // gateway cannot run — ignore the call and deliver the text as-is.
+            var retryMentioned = ToolCallParser.MentionedToolNames(cleanRetry.Content);
+            if (retryMentioned.Any(name => ToolCallParser.IsDeepSeekNativeTool(name)))
+                return new Resolution(ToResult(prepared, cleanRetry, cleanRetry.FinishReason, []), null);
+
+            // Any remaining markup the client cannot execute — deliver the text
+            // as a plain answer instead of failing with HTTP 502.
+            return new Resolution(ToResult(prepared, cleanRetry, cleanRetry.FinishReason, []), null);
         }
 
         // No tools were offered: any remaining markup is for a tool the client does
         // not have. Never surface it as an executable call.
-        if (ToolCallParser.LooksLikeToolCallMarkup(retry.Content) ||
-            ToolCallParser.LooksLikeCodeDumpInsteadOfTool(retry.Content))
-            return new Resolution(null, null);
+        if (ToolCallParser.LooksLikeToolCallMarkup(cleanRetry.Content) ||
+            ToolCallParser.LooksLikeCodeDumpInsteadOfTool(cleanRetry.Content))
+        {
+            // If every call is a placeholder name (no_tool_available etc.), deliver
+            // the text as a plain answer instead of failing with HTTP 502.
+            if (ToolCallParser.AllPlaceholderToolCalls(cleanRetry.Content))
+                return new Resolution(ToResult(prepared, cleanRetry, cleanRetry.FinishReason, []), null);
 
-        return new Resolution(ToResult(prepared, retry, retry.FinishReason, []), null);
+            var retryMentioned2 = ToolCallParser.MentionedToolNames(cleanRetry.Content);
+            if (retryMentioned2.Any(name => ToolCallParser.IsDeepSeekNativeTool(name)))
+                return new Resolution(ToResult(prepared, cleanRetry, cleanRetry.FinishReason, []), null);
+
+            // Any remaining markup the client cannot execute — deliver the text
+            // as a plain answer instead of failing with HTTP 502.
+            return new Resolution(ToResult(prepared, cleanRetry, cleanRetry.FinishReason, []), null);
+        }
+
+        return new Resolution(ToResult(prepared, cleanRetry, cleanRetry.FinishReason, []), null);
     }
 
     private async Task<CompletionResult> RepairAsync(Prepared prepared, ChatCompletionRequest request, string retryPrompt,
@@ -308,15 +374,9 @@ internal sealed class ChatCompletionService
         }
         catch (UpstreamException ex) when (ex.StatusCode is 429 or 503)
         {
-            // The repair never ran. Fall back to the original reply, unless that
-            // reply is itself tool markup.
-            if (ToolCallParser.LooksLikeToolCallMarkup(original.Content))
-            {
-                AppLog.Warn($"{trace} повтор не удался из-за троттлинга ({ex.Message})");
-                throw Unusable(ex.Message);
-            }
-
-            AppLog.Info($"{trace} повтор не удался ({ex.Message}), возвращаем исходный ответ");
+            // The repair never ran. Fall back to the original reply — even if it
+            // contains tool markup, delivering the text is better than HTTP 502.
+            AppLog.Warn($"{trace} повтор не удался ({ex.Message}), возвращаем исходный ответ");
             return ToResult(prepared, original, original.FinishReason, []);
         }
 
@@ -437,8 +497,9 @@ internal sealed class ChatCompletionService
 
             var prompt = explicitPrompt ?? BuildPrompt(request, prepared, startIndex, budget);
 
+            var mode = startIndex == 0 ? "полный транскрипт" : "только новые ходы";
             AppLog.Info($"{trace} аккаунт {account.Id} · отправка в DeepSeek ({prompt.Length} симв." +
-                        (session is null ? ")" : $") · сессия {Shorten(session.ChatSessionId)}, только новые ходы"));
+                        (session is null ? ")" : $") · сессия {Shorten(session.ChatSessionId)}, {mode}"));
             Wire.Write("ask", "hop={0} · account={1} · prompt={2} chars · start_index={3} · budget={4} · session={5}",
                 hop, account.Id, prompt.Length, startIndex, budget,
                 session is null ? "(fresh)" : $"{Shorten(session.ChatSessionId)}/{Shorten(session.ParentMessageId)}");
@@ -459,9 +520,7 @@ internal sealed class ChatCompletionService
             catch (UpstreamRateLimitException ex)
             {
                 _pool.MarkRateLimited(account, ex.RetryAfterMs);
-                account.Failures++;
-                account.TotalFailures++;
-                account.LastError = ex.Message;
+                account.MarkFailure(ex.Message);
 
                 var pauseSec = Math.Max(1, (int)(_pool.NextCooldownMs() / 1000));
                 AppLog.Warn($"{trace} троттлинг · аккаунт {account.Id} на паузе {pauseSec}с · {ex.Message}");
@@ -480,7 +539,7 @@ internal sealed class ChatCompletionService
                 // would only burn another login, so the same hop is retried against a
                 // freshly opened session carrying the whole transcript.
                 _pool.MarkSuccess(account);
-                account.LastError = ex.Message;
+                account.MarkFailure(ex.Message);
                 _sessions.Reset(session.AgentId);
 
                 AppLog.Warn($"{trace} сессия {Shorten(session.ChatSessionId)} не принимается ({ex.StatusCode}) · начинаем новую");
@@ -525,8 +584,8 @@ internal sealed class ChatCompletionService
         var reserved = prepared.Tools.Count > 0
             ? new List<string?>
             {
-                ToolPrompts.FormatToolDefinitions(prepared.Tools, budget),
-                ToolPrompts.FormatToolReminder(prepared.Tools),
+                ToolPrompts.FormatToolDefinitions(prepared.Tools, budget, prepared.Model.SearchEnabled),
+                ToolPrompts.FormatToolReminder(prepared.Tools, prepared.Model.SearchEnabled),
             }
             : [];
 
@@ -905,16 +964,14 @@ internal sealed class ChatCompletionService
 
     private static async Task BackoffAsync(int attempt, Trace trace, CancellationToken ct)
     {
-        var delay = Math.Min(500 * attempt, 1500);
+        var delay = Math.Min(BackoffBaseMs * attempt, BackoffMaxMs);
         AppLog.Muted($"{trace} пауза {delay} мс перед повтором");
         await Task.Delay(delay, ct);
     }
 
     private void Fail(Account account, Exception ex)
     {
-        account.Failures++;
-        account.TotalFailures++;
-        account.LastError = ex.Message;
+        account.MarkFailure(ex.Message);
         if (ex is UpstreamException { StatusCode: 429 } rateLimited)
             _pool.MarkRateLimited(account, rateLimited.RetryAfterMs);
         else if (ex is UpstreamException { StatusCode: 401 or 403 })

@@ -117,7 +117,14 @@ internal static partial class ToolCallParser
                     @"browser_?type|browser_?screenshot|browser_?navigate|execute_?code|code_?interpreter|" +
                     @"run_?commands?|shell_?command|terminal_?command|exec_?command|" +
                     @"read_?file|write_?file|edit_?file|create_?file|delete_?file|list_?files|" +
-                    @"search_?files|apply_?patch|task|terminate|ask_?user)$",
+                    @"search_?files|apply_?patch|task|terminate|ask_?user|" +
+                    @"cat_?file|open_?file|get_?file|fetch_?file|read_?path|" +
+                    @"save_?file|update_?file|put_?file|store_?file|write_?path|create_?path|" +
+                    @"modify_?file|change_?file|replace_?file|patch_?file|edit_?path|" +
+                    @"list_?directory|get_?files|scan_?files|list_?path|" +
+                    @"execute_?command|\bcmd\b|\bcommand\b|run_?cmd|run_?shell|\bsh\b|powershell|" +
+                    @"find_?files|grep_?file|search_?in_?files|\bfind\b|" +
+                    @"validate_?file|check_?file|parse_?file|lint_?file)$",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex NativeToolRegex();
 
@@ -130,8 +137,15 @@ internal static partial class ToolCallParser
     internal static bool HasDsmlToolMarkup(string? text) =>
         !string.IsNullOrEmpty(text) && DsmlMarkerRegex().IsMatch(text);
 
-    internal static bool LooksLikeToolCallMarkup(string? text) =>
-        !string.IsNullOrEmpty(text) && ToolCallMarkupRegex().IsMatch(text);
+    internal static bool LooksLikeToolCallMarkup(string? text)
+    {
+        if (string.IsNullOrEmpty(text)) return false;
+        if (HasDsmlToolMarkup(text)) return true;
+        if (!ToolCallMarkupRegex().IsMatch(text)) return false;
+
+        var calls = CollectJsonToolCalls(text);
+        return calls.Count == 0 || calls.Any(call => !IsPlaceholderName(call.Name));
+    }
 
     internal static bool IsDeepSeekNativeTool(string? name) =>
         !string.IsNullOrEmpty(name) && NativeToolRegex().IsMatch(name);
@@ -287,6 +301,67 @@ internal static partial class ToolCallParser
     }
 
     /// <summary>
+    /// <summary>
+    /// True when every tool call found in the text is a placeholder name
+    /// (none, null, no_tool, no_tool_available, …), meaning the model explicitly
+    /// declined to use any tool.
+    /// </summary>
+    internal static bool AllPlaceholderToolCalls(string? text)
+    {
+        if (string.IsNullOrEmpty(text)) return false;
+
+        // First try the full parser.
+        var raw = HasDsmlToolMarkup(text) ? ListDsmlToolCalls(text) : CollectJsonToolCalls(text);
+        if (raw.Count > 0)
+        {
+            foreach (var call in raw)
+                if (!IsPlaceholderName(call.Name)) return false;
+            return true;
+        }
+
+        // Fallback: plain regex search for placeholder names in the raw text.
+        // This catches cases where the markup is malformed enough that the JSON
+        // scanner skips it, but the model still emitted a no-op call.
+        var placeholderMatch = Regex.Match(text,
+            "\"name\"\\s*:\\s*\"(noop|no_tool|no_tool_available|no_tools_available|none|null|nil|no-op)\"",
+            RegexOptions.IgnoreCase);
+        return placeholderMatch.Success;
+    }
+
+    /// <summary>
+    /// Strips tool-call markup from text so it can be safely delivered as plain
+    /// answer content. Removes JSON tool_call envelopes, DSML blocks and TOOL_CALL:
+    /// legacy markers, leaving any surrounding prose intact.
+    /// </summary>
+    internal static string StripToolCallMarkup(string? text)
+    {
+        if (string.IsNullOrEmpty(text)) return text;
+
+        var result = text;
+
+        // Remove JSON tool_call envelopes: {"tool_call":{"name":"...","arguments":{...}}}
+        result = Regex.Replace(result,
+            @"\{\s*""tool_call""\s*:\s*\{\s*""name""\s*:\s*""[^""]*""\s*,\s*""arguments""\s*:\s*\{[^}]*\}\s*\}\s*\}",
+            "", RegexOptions.IgnoreCase);
+
+        // Remove DSML tool call blocks.
+        result = Regex.Replace(result,
+            @"<[^>]*DSML[^>]*>[\s\S]*?</[^>]*DSML[^>]*>",
+            "", RegexOptions.IgnoreCase);
+
+        // Remove TOOL_CALL: legacy markers.
+        result = Regex.Replace(result,
+            @"TOOL_CALL:\s*[\w-]+\s*\{[^}]*\}",
+            "", RegexOptions.IgnoreCase);
+
+        // Remove Fenced JSON blocks that contain tool_call.
+        result = Regex.Replace(result,
+            @"```(?:json)?\s*\{\s*""tool_call""[\s\S]*?\}\s*```",
+            "", RegexOptions.IgnoreCase);
+
+        return result.Trim();
+    }
+
     internal static IReadOnlyList<ParsedToolCall> CollectAgentToolCalls(string? text, IReadOnlySet<string> allowed)
     {
         if (string.IsNullOrEmpty(text) || allowed.Count == 0) return [];
@@ -319,6 +394,10 @@ internal static partial class ToolCallParser
     /// </summary>
     private static string? AllowedName(string name, IReadOnlySet<string> allowed)
     {
+        // "no_tool" is the model explicitly declining to use a tool. Filter it out
+        // so the text content passes through as a normal assistant reply.
+        if (name.Equals("no_tool", StringComparison.OrdinalIgnoreCase)) return null;
+
         // An exact hit wins even for an odd name: a client really offering a tool
         // called "none" gets it.
         if (allowed.Contains(name)) return name;
@@ -346,23 +425,180 @@ internal static partial class ToolCallParser
     /// </summary>
     private static readonly (string Native, string Local)[] NativeToolAliases =
     [
+        // --- file reading ---
         ("read_file", "read"),
         ("read_files", "read"),
         ("view_file", "read"),
+        ("cat_file", "read"),
+        ("open_file", "read"),
+        ("get_file", "read"),
+        ("fetch_file", "read"),
+        ("read_path", "read"),
+
+        // --- file writing ---
         ("write_file", "write"),
         ("create_file", "write"),
+        ("save_file", "write"),
+        ("update_file", "write"),
+        ("put_file", "write"),
+        ("store_file", "write"),
+        ("write_path", "write"),
+        ("create_path", "write"),
+
+        // --- file editing ---
         ("edit_file", "edit"),
         ("apply_patch", "edit"),
+        ("modify_file", "edit"),
+        ("change_file", "edit"),
+        ("replace_file", "edit"),
+        ("patch_file", "edit"),
+        ("edit_path", "edit"),
+
+        // --- directory listing ---
         ("list_files", "glob"),
         ("list_dir", "glob"),
+        ("list_directory", "glob"),
+        ("get_files", "glob"),
+        ("scan_files", "glob"),
+        ("list_path", "glob"),
+        ("ls", "glob"),
+
+        // --- command execution ---
         ("run_command", "bash"),
         ("run_commands", "bash"),
         ("shell_command", "bash"),
         ("terminal_command", "bash"),
         ("exec_command", "bash"),
+        ("execute_command", "bash"),
+        ("cmd", "bash"),
+        ("command", "bash"),
+        ("run_cmd", "bash"),
+        ("run_shell", "bash"),
+        ("sh", "bash"),
+        ("powershell", "bash"),
+
+        // --- file searching ---
         ("search_files", "grep"),
         ("search_file", "grep"),
+        ("find_files", "grep"),
+        ("grep_file", "grep"),
+        ("search_in_files", "grep"),
+        ("find", "grep"),
+
+        // --- file validation / checking ---
+        ("validate_file", "check"),
+        ("check_file", "check"),
+        ("parse_file", "check"),
+        ("lint_file", "check"),
+
+        // --- web search (DeepSeek native, cannot run locally) ---
+        // These are intentionally NOT mapped — SearchWithDeepSeekAsync handles them
+        // by re-asking DeepSeek with search_enabled=true and returning text.
+        ("web_search", "web_search"),
+        ("websearch", "web_search"),
+        ("web_fetch", "web_search"),
+        ("websearch_tool", "web_search"),
+        ("browser_search", "web_search"),
     ];
+
+    /// <summary>
+    /// Attempts to extract a tool call from truncated content. When DeepSeek is
+    /// generating a very large tool call the response can be cut off mid-JSON,
+    /// leaving markup that looks like a call but cannot be parsed. This method
+    /// recovers whatever it can: the tool name and a best-effort arguments object.
+    /// Only used as a last resort before giving up on a truncated response.
+    /// </summary>
+    internal static IReadOnlyList<ParsedToolCall>? TryExtractTruncatedToolCall(
+        string? text, IReadOnlySet<string> allowed)
+    {
+        if (string.IsNullOrEmpty(text) || text.Length > MaxToolMarkupChars) return null;
+
+        // Find the tool name
+        var nameMatch = Regex.Match(text, @"""name""\s*:\s*""([^""]+)""", RegexOptions.IgnoreCase);
+        if (!nameMatch.Success) return null;
+
+        var toolName = nameMatch.Groups[1].Value.Trim();
+        if (!ToolNameRegex().IsMatch(toolName)) return null;
+
+        // Map native names to allowed names
+        var allowedName = AllowedName(toolName, allowed);
+        if (allowedName is null) return null;
+
+        // Try to find and parse arguments
+        var argsMatch = Regex.Match(text, @"""arguments""\s*:\s*", RegexOptions.IgnoreCase);
+        if (argsMatch.Success)
+        {
+            var argsStart = argsMatch.Index + argsMatch.Length;
+            var argsText = text[argsStart..];
+
+            // Try to extract a balanced JSON object from the arguments
+            var balanced = ExtractBalancedJsonObjects(argsText, 1);
+            if (balanced.Count > 0 && TryParseJsonObject(balanced[0], out var parsed))
+            {
+                var serialized = parsed!.ToJsonString(CompactJson);
+                if (serialized.Length <= MaxToolArgumentChars)
+                    return [new ParsedToolCall(allowedName, serialized)];
+            }
+
+            // Try to extract a partial JSON object by finding complete key-value pairs
+            var partial = TryExtractPartialJsonObject(argsText);
+            if (partial is not null && TryParseJsonObject(partial, out var partialParsed))
+            {
+                var serialized = partialParsed!.ToJsonString(CompactJson);
+                if (serialized.Length <= MaxToolArgumentChars)
+                    return [new ParsedToolCall(allowedName, serialized)];
+            }
+        }
+
+        // No arguments found, return empty arguments
+        return [new ParsedToolCall(allowedName, "{}")];
+    }
+
+    /// <summary>
+    /// Extracts a partial JSON object from truncated text. Finds the last complete
+    /// key-value pair and closes the object there, producing valid JSON.
+    /// </summary>
+    private static string? TryExtractPartialJsonObject(string text)
+    {
+        var lastComma = -1;
+        var depth = 0;
+        var inString = false;
+        var escape = false;
+
+        for (var i = 0; i < text.Length; i++)
+        {
+            var ch = text[i];
+
+            if (escape) { escape = false; continue; }
+            if (ch == '\\' && inString) { escape = true; continue; }
+            if (ch == '"') { inString = !inString; continue; }
+            if (inString) continue;
+
+            switch (ch)
+            {
+                case '{': depth++; break;
+                case '}':
+                    depth--;
+                    if (depth == 0)
+                    {
+                        // Complete object found
+                        return text[..(i + 1)];
+                    }
+                    break;
+                case ',' when depth == 1:
+                    lastComma = i;
+                    break;
+            }
+        }
+
+        // No complete object, but we might have complete key-value pairs
+        if (lastComma > 0)
+        {
+            return text[..lastComma] + "}";
+        }
+
+        return null;
+    }
 
     /// <summary>
     /// The call to act on. When the client offered tools, only those are
@@ -881,13 +1117,30 @@ internal static partial class ToolCallParser
     }
 
     /// <summary>Names a model uses to mean "no tool", rather than to name one.</summary>
-    private static bool IsPlaceholderName(string name) =>
-        name.Equals("none", StringComparison.OrdinalIgnoreCase) ||
-        name.Equals("null", StringComparison.OrdinalIgnoreCase) ||
-        name.Equals("nil", StringComparison.OrdinalIgnoreCase) ||
-        name.Equals("no_tool", StringComparison.OrdinalIgnoreCase) ||
-        name.Equals("no-op", StringComparison.OrdinalIgnoreCase) ||
-        name.Equals("noop", StringComparison.OrdinalIgnoreCase);
+    private static bool IsPlaceholderName(string name)
+    {
+        var token = name.Trim().Trim('"', '\'');
+        if (token.Length == 0) return true;
+        return token.Equals("none", StringComparison.OrdinalIgnoreCase) ||
+               token.Equals("null", StringComparison.OrdinalIgnoreCase) ||
+               token.Equals("nil", StringComparison.OrdinalIgnoreCase) ||
+               token.Equals("no_tool", StringComparison.OrdinalIgnoreCase) ||
+               token.Equals("no_tool_available", StringComparison.OrdinalIgnoreCase) ||
+               token.Equals("no_tools_available", StringComparison.OrdinalIgnoreCase) ||
+               token.Equals("no-op", StringComparison.OrdinalIgnoreCase) ||
+               token.Equals("noop", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// True when the model explicitly declined to use a tool. The gateway treats
+    /// this as a text-only answer rather than a failed call.
+    /// </summary>
+    internal static bool IsNoToolCall(string? text)
+    {
+        if (string.IsNullOrEmpty(text)) return false;
+        return text.Contains("\"name\":\"no_tool\"", StringComparison.OrdinalIgnoreCase) ||
+               text.Contains("\"name\": \"no_tool\"", StringComparison.OrdinalIgnoreCase);
+    }
 
     private static bool TryParseJsonObject(string raw, out JsonObject? value)
     {

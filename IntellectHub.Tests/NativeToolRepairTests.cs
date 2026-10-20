@@ -24,10 +24,10 @@ public sealed class NativeToolRepairTests
         ImmutableHashSet.Create("read", "write", "glob", "bash", "edit", "grep", "check");
 
     // Search on or off comes from the model the request names, not from a flag here.
-    private static ChatCompletionService.Prepared Prepared(bool searchEnabled = true) => ChatCompletionService.Prepare(
+    private static ChatCompletionService.Prepared Prepared(bool searchEnabled = false) => ChatCompletionService.Prepare(
         new ChatCompletionRequest
         {
-            Model = searchEnabled ? "deepseek-v4-flash" : "deepseek-v4-flash-nosearch",
+            Model = searchEnabled ? "deepseek-v4-flash-search" : "deepseek-v4-flash-nosearch",
             Messages = [new ChatMessage { Role = "user", Content = JsonSerializer.SerializeToElement("сделай") }],
             Tools = [Tool("read"), Tool("write")],
         },

@@ -267,26 +267,32 @@ public sealed class ToolReplyResolutionTests
     [Fact]
     public void ARepairReplyAskingForANativeTool_IsNeverEmittedAsAToolCall()
     {
-        // This is the loop Cline hit: the repair round answered with run_commands
-        // and the gateway handed it back as an executable tool call.
+        // This is the loop Cline hit: the repair round answered with run_commands.
+        // The gateway cannot run native DeepSeek tools, so instead of a 502 it
+        // ignores the call and delivers stripped text — the model adapts.
         const string retryReply = "{\"tool_call\":{\"name\":\"run_commands\",\"arguments\":{\"command\":\"dir /a\"}}}";
 
         var resolution = ChatCompletionService.ResolveRepair(ChatOnly(), Reply(retryReply));
 
-        Assert.Null(resolution.Result);
         Assert.Null(resolution.RetryPrompt);
-        Assert.True(resolution.Unusable);
+        Assert.NotNull(resolution.Result);
+        Assert.False(resolution.Result!.HasToolCalls);
+        Assert.Equal(string.Empty, resolution.Result.Content);
     }
 
     [Fact]
     public void ARepairReplyAskingForATrulyForeignTool_IsAlsoNotEmitted()
     {
+        // Foreign tool (delete_everything) cannot be executed. Instead of HTTP 502,
+        // the gateway strips the markup and delivers empty text.
         const string retryReply = "{\"tool_call\":{\"name\":\"delete_everything\",\"arguments\":{}}}";
 
         var resolution = ChatCompletionService.ResolveRepair(ChatOnly(), Reply(retryReply));
 
-        Assert.Null(resolution.Result);
-        Assert.True(resolution.Unusable);
+        Assert.Null(resolution.RetryPrompt);
+        Assert.NotNull(resolution.Result);
+        Assert.False(resolution.Result.HasToolCalls);
+        Assert.Equal(string.Empty, resolution.Result.Content);
     }
 
     [Fact]

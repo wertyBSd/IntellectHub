@@ -1,5 +1,8 @@
 using Spectre.Console;
 using Spectre.Console.Rendering;
+using SpectrePanel = Spectre.Console.Panel;
+using SpectreColor = Spectre.Console.Color;
+using SpectrePadding = Spectre.Console.Padding;
 
 namespace IntellectHub.Client;
 
@@ -31,11 +34,11 @@ public static class Banner
         grid.AddColumn(new GridColumn());
         grid.AddRow(logo, info);
 
-        return new Panel(grid)
+        return new SpectrePanel(grid)
         {
             Border = BoxBorder.Rounded,
-            BorderStyle = new Style(Color.Gold1),
-            Padding = new Padding(1, 0, 1, 0),
+            BorderStyle = new Style(SpectreColor.Gold1),
+            Padding = new SpectrePadding(1, 0, 1, 0),
         };
     }
 

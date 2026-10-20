@@ -45,12 +45,27 @@ internal static class ModelRegistry
     public static readonly IReadOnlyDictionary<string, ModelConfig> Configs =
         new Dictionary<string, ModelConfig>(StringComparer.Ordinal)
         {
+            // Default models: no web search. DeepSeek's native web_search is a
+            // built-in tool this gateway cannot run, so enabling it on the default
+            // model makes the model call web_search and the turn ends in a 502.
             ["deepseek-v4-flash"] = new()
+            {
+                ModelType = "default", ThinkingEnabled = false, SearchEnabled = false,
+                RealModel = "DeepSeek-V4.1-Flash", Capabilities = NoThinkNoSearch,
+            },
+            ["deepseek-v4-flash-thinking"] = new()
+            {
+                ModelType = "default", ThinkingEnabled = true, SearchEnabled = false,
+                RealModel = "DeepSeek-V4.1-Flash (thinking)", Capabilities = ThinkNoSearch,
+            },
+            // Web search only on explicit -search aliases, exactly as the reference
+            // gateway (FreeDeepseekAPI) does it.
+            ["deepseek-v4-flash-search"] = new()
             {
                 ModelType = "default", ThinkingEnabled = false, SearchEnabled = true,
                 RealModel = "DeepSeek-V4.1-Flash (web search)", Capabilities = NoThink,
             },
-            ["deepseek-v4-flash-thinking"] = new()
+            ["deepseek-v4-flash-thinking-search"] = new()
             {
                 ModelType = "default", ThinkingEnabled = true, SearchEnabled = true,
                 RealModel = "DeepSeek-V4.1-Flash (thinking + web search)", Capabilities = Full,
@@ -77,13 +92,15 @@ internal static class ModelRegistry
         if (id == "deepseek-flash" || id.StartsWith("deepseek-flash-", StringComparison.Ordinal))
             id = "deepseek-v4-flash" + id["deepseek-flash".Length..];
 
+        // Try the exact id first — this keeps -search variants as separate models
+        // instead of collapsing them onto the non-search base.
+        if (Configs.ContainsKey(id)) return id;
+
         if (id.EndsWith("-search", StringComparison.Ordinal))
         {
             var baseId = id[..^"-search".Length];
             if (Configs.ContainsKey(baseId)) return baseId;
         }
-
-        if (Configs.ContainsKey(id)) return id;
 
         if (id.Contains("opus", StringComparison.Ordinal) || id.Contains("opus-4", StringComparison.Ordinal))
             return "deepseek-v4-flash-thinking";

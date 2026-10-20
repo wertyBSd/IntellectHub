@@ -1,8 +1,12 @@
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
+using Microsoft.Web.WebView2.WinForms;
+using Microsoft.Web.WebView2.Core;
+using System.Windows.Forms;
 
 namespace IntellectHub.Client;
 
@@ -26,14 +30,14 @@ public sealed class ToolRegistry
                 },
                 ["required"] = new JsonArray("path"),
             }),
-        Spec("write", "Create or overwrite a UTF-8 text file in the workspace.",
+        Spec("write", "Create or overwrite a UTF-8 text file in the workspace. Use this tool whenever the user asks you to create, generate, write, or save a file (code, documentation, markdown, config, etc.). Provide the full file content in the 'content' argument.",
             new JsonObject
             {
                 ["type"] = "object",
                 ["properties"] = new JsonObject
                 {
-                    ["path"] = new JsonObject { ["type"] = "string" },
-                    ["content"] = new JsonObject { ["type"] = "string" },
+                    ["path"] = new JsonObject { ["type"] = "string", ["description"] = "File path relative to the workspace or absolute. Use forward slashes." },
+                    ["content"] = new JsonObject { ["type"] = "string", ["description"] = "Complete file content to write. For large files, include the entire content in one call." },
                 },
                 ["required"] = new JsonArray("path", "content"),
             }),
@@ -90,6 +94,36 @@ public sealed class ToolRegistry
                 },
                 ["required"] = new JsonArray("path"),
             }),
+        Spec("browser_navigate", "Navigate to a URL in a headless browser (WebView2).",
+            new JsonObject
+            {
+                ["type"] = "object",
+                ["properties"] = new JsonObject
+                {
+                    ["url"] = new JsonObject { ["type"] = "string", ["description"] = "URL to open." },
+                },
+                ["required"] = new JsonArray("url"),
+            }),
+        Spec("browser_screenshot", "Take a screenshot of the current browser page and save it to a file.",
+            new JsonObject
+            {
+                ["type"] = "object",
+                ["properties"] = new JsonObject
+                {
+                    ["path"] = new JsonObject { ["type"] = "string", ["description"] = "Output PNG file path relative to the workspace or absolute." },
+                },
+                ["required"] = new JsonArray("path"),
+            }),
+        Spec("browser_click", "Click an element on the current page by CSS selector.",
+            new JsonObject
+            {
+                ["type"] = "object",
+                ["properties"] = new JsonObject
+                {
+                    ["selector"] = new JsonObject { ["type"] = "string", ["description"] = "CSS selector of the element to click." },
+                },
+                ["required"] = new JsonArray("selector"),
+            }),
     ];
 
     public async Task<ToolResult> ExecuteAsync(ToolCall call, CancellationToken ct = default)
@@ -107,6 +141,13 @@ public sealed class ToolRegistry
 
         try
         {
+            // Validate required arguments before dispatching. A missing required
+            // argument is a client error — we must not silently truncate or
+            // corrupt files because the model forgot an argument.
+            var missing = RequiredArgsMissing(call.Name, args);
+            if (missing.Count > 0)
+                return new ToolResult($"Missing required arguments: {string.Join(", ", missing)}", IsError: true);
+
             return call.Name switch
             {
                 "read" => Read(GetString(args, "path")),
@@ -116,6 +157,9 @@ public sealed class ToolRegistry
                 "edit" => Edit(GetString(args, "path"), GetString(args, "oldString"), GetString(args, "newString")),
                 "grep" => Grep(GetString(args, "pattern"), GetString(args, "path")),
                 "check" => Check(GetString(args, "path")),
+                "browser_navigate" => await BrowserNavigateAsync(GetString(args, "url")),
+                "browser_screenshot" => await BrowserScreenshotAsync(GetString(args, "path")),
+                "browser_click" => await BrowserClickAsync(GetString(args, "selector")),
                 _ => new ToolResult($"Unknown tool: {call.Name}", IsError: true),
             };
         }
@@ -136,7 +180,10 @@ public sealed class ToolRegistry
     {
         var full = Resolve(path);
         Directory.CreateDirectory(Path.GetDirectoryName(full) ?? _workspace);
-        File.WriteAllText(full, content);
+        // Explicit UTF-8 without BOM so Cyrillic and other non-ASCII text is
+        // preserved correctly on Windows (where the default ANSI code page can
+        // mangle non-Latin characters).
+        File.WriteAllText(full, content, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
         return new ToolResult($"Wrote {content.Length} chars to {path}");
     }
 
@@ -284,6 +331,58 @@ public sealed class ToolRegistry
         return new ToolResult(output.ToString(), IsError: process.ExitCode != 0);
     }
 
+    private async Task<ToolResult> BrowserNavigateAsync(string url)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+            return new ToolResult("url is empty", IsError: true);
+
+        try
+        {
+            var session = await BrowserSession.Instance;
+            await session.NavigateAsync(url);
+            return new ToolResult($"Opened {url}");
+        }
+        catch (Exception ex)
+        {
+            return new ToolResult($"Browser navigate failed: {ex.Message}", IsError: true);
+        }
+    }
+
+    private async Task<ToolResult> BrowserScreenshotAsync(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return new ToolResult("path is empty", IsError: true);
+
+        try
+        {
+            var session = await BrowserSession.Instance;
+            var full = Resolve(path);
+            await session.ScreenshotAsync(full);
+            return new ToolResult($"Screenshot saved to {path}");
+        }
+        catch (Exception ex)
+        {
+            return new ToolResult($"Browser screenshot failed: {ex.Message}", IsError: true);
+        }
+    }
+
+    private async Task<ToolResult> BrowserClickAsync(string selector)
+    {
+        if (string.IsNullOrWhiteSpace(selector))
+            return new ToolResult("selector is empty", IsError: true);
+
+        try
+        {
+            var session = await BrowserSession.Instance;
+            await session.ClickAsync(selector);
+            return new ToolResult($"Clicked {selector}");
+        }
+        catch (Exception ex)
+        {
+            return new ToolResult($"Browser click failed: {ex.Message}", IsError: true);
+        }
+    }
+
     /// <summary>
     /// Maps a tool-supplied path onto the workspace.
     ///
@@ -326,4 +425,36 @@ public sealed class ToolRegistry
 
     private static ToolSpec Spec(string name, string description, JsonNode schema) =>
         new() { Name = name, Description = description, InputSchema = schema };
+
+    /// <summary>
+    /// Returns the names of required arguments that are missing or empty for a
+    /// tool call. Used to prevent silent data loss (e.g. write without content
+    /// would truncate a file to zero bytes).
+    /// </summary>
+    private static List<string> RequiredArgsMissing(string toolName, JsonObject args)
+    {
+        var missing = new List<string>();
+        bool Has(string name) =>
+            args.TryGetPropertyValue(name, out var node) &&
+            node is JsonValue value &&
+            value.TryGetValue<string>(out var s) &&
+            !string.IsNullOrWhiteSpace(s);
+
+        return toolName switch
+        {
+            "read" when !Has("path") => new List<string> { "path" },
+            "write" when !Has("path") || !Has("content") =>
+                new List<string> { "path", "content" }.Where(m => !Has(m)).ToList(),
+            "edit" when !Has("path") || !Has("oldString") || !Has("newString") =>
+                new List<string> { "path", "oldString", "newString" }.Where(m => !Has(m)).ToList(),
+            "glob" when !Has("pattern") => new List<string> { "pattern" },
+            "bash" when !Has("command") => new List<string> { "command" },
+            "grep" when !Has("pattern") => new List<string> { "pattern" },
+            "check" when !Has("path") => new List<string> { "path" },
+            "browser_navigate" when !Has("url") => new List<string> { "url" },
+            "browser_screenshot" when !Has("path") => new List<string> { "path" },
+            "browser_click" when !Has("selector") => new List<string> { "selector" },
+            _ => missing,
+        };
+    }
 }

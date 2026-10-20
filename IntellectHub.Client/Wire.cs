@@ -47,7 +47,7 @@ internal static class Wire
     };
 
     private static int _seq;
-    private static Timer? _flushTimer;
+    private static System.Threading.Timer? _flushTimer;
 
     /// <summary>
     /// Starts the flush pump. This has to run before the first entry is queued:
@@ -56,7 +56,7 @@ internal static class Wire
     /// </summary>
     static Wire()
     {
-        _flushTimer = new Timer(_ => Flush(), null, 300, 300);
+        _flushTimer = new System.Threading.Timer(_ => Flush(), null, 300, 300);
         AppDomain.CurrentDomain.ProcessExit += (_, _) => Flush();
     }
 

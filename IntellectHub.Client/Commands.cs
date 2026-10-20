@@ -79,6 +79,7 @@ internal static class CommandLine
         new("/approve",  "/approve [ask|writes|all]", "how much runs without asking", ["/approvals"]),
         new("/project",  "/project [path]",    "switch the working project", ["/cd"]),
         new("/clear",    "/clear",             "clear the conversation", ["/reset"]),
+        new("/plan",     "/plan",              "break current task into subtasks", ["/decompose"]),
         new("/exit",     "/exit",              "leave", ["/quit", "/q"]),
     ];
 

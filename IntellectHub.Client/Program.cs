@@ -1,4 +1,6 @@
 using System.Globalization;
+using System.Linq;
+using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using IntellectHub.Client;
@@ -66,16 +68,16 @@ using var screen = new Ui();
 var api = new ApiClient(config);
 var history = new List<ChatMessage>();
 
-// Identity of this conversation for the gateway. The gateway keys its remote
-// DeepSeek chat on it: send it and each turn continues the chat that is already
-// open instead of paying for a fresh session every time. It is rotated whenever
-// the transcript is dropped, because a session is only reusable while the
-// history it was built from still matches what the client sends.
+// Identity of this conversation for the gateway.
 var sessionKey = NewSessionKey();
 
 var project = Project.Open(ResolveProjectRoot());
 var tools = new ToolRegistry(project.Root);
 var log = new SessionLog(project.LogPath);
+
+// Планировщик подзадач: когда модель возвращает JSON-план со списком подзадач,
+// клиент выполняет их по очереди, один за другим.
+TaskPlanner? _planner = null;
 
 RefreshHeader();
 screen.Write("IntellectHub Console — type a message, or /help for commands.", ConsoleColor.DarkGray);
@@ -88,8 +90,7 @@ while (true)
     if (input is null) break;
     if (input.Length == 0) continue;
 
-    // Anything with a leading slash is the shell's business. Falling through to
-    // the model would turn a typo into a billed, confusing question.
+    // Anything with a leading slash is the shell's business.
     var parsed = CommandLine.Parse(input);
     switch (parsed.Kind)
     {
@@ -113,6 +114,7 @@ while (true)
     }
     catch (Exception ex)
     {
+        Sound.Error();
         screen.Write("error: " + ex.Message, ConsoleColor.Red);
         Wire.Write("turn.err", "{0}: {1}", ex.GetType().Name, ex.Message);
         Wire.Block("turn.err.st", ex.ToString());
@@ -163,7 +165,8 @@ async Task RunTurnAsync()
     var turnId = Wire.NewTraceId();
 
     Wire.TraceId = null;
-    Wire.Write("turn", "start · history={0} msgs · tools={1}", history.Count, tools.Specs.Count);
+    Wire.Write("turn", "start · history={0} msgs · tools={1} · planner={2}",
+        history.Count, tools.Specs.Count, _planner is not null ? "active" : "none");
 
     for (var step = 0; step < 16; step++)
     {
@@ -175,14 +178,36 @@ async Task RunTurnAsync()
         Wire.TraceId = traceId;
         Wire.Write("step", "{0} of 16 · history={1} msgs", step, history.Count);
 
+        // Если есть активный планировщик и следующая подзадача — просим модель
+        // выполнить именно её, а не ждать нового плана.
+        if (_planner is not null && _planner.HasNext)
+        {
+            var subtask = _planner.Current!;
+            var subtaskPrompt = new ChatMessage
+            {
+                Role = "user",
+                Content = JsonValue.Create(
+                    $"Выполни подзадачу {subtask.Index + 1} из {_planner.Total}: {subtask.Title}\n\n" +
+                    $"Описание: {subtask.Description}\n\n" +
+                    $"Используй инструменты write/edit, чтобы записать свою часть результата в файл docs/manual.md. " +
+                    $"Не пытайся сделать всё за один вызов — пиши только эту часть. " +
+                    $"Когда закончишь, напиши краткий отчёт текстом без вызовов инструментов.")
+            };
+            history.Add(subtaskPrompt);
+            Wire.Write("planner.subtask", "executing subtask {0}/{1}: {2}", subtask.Index + 1, _planner.Total, subtask.Title);
+        }
+
         AssistantReply reply;
         var callClock = System.Diagnostics.Stopwatch.StartNew();
         try
         {
             reply = await api.SendAsync(history, tools.Specs, traceId, sessionKey);
+            Sound.Notify();
         }
         catch (Exception ex)
         {
+            Console.Beep(1047, 60);
+            Console.Beep(1318, 80);
             Wire.Write("step.err", "{0}: {1}", ex.GetType().Name, ex.Message);
             throw;
         }
@@ -196,8 +221,101 @@ async Task RunTurnAsync()
         if (reply.Text.Trim().Length > 0)
             log.Thought(reply.Text.Trim());
 
-        if (!reply.HasToolCalls)
+        // Если все вызовы инструментов — placeholder-имена (noop, no_tool_available и т.д.),
+        // трактуем это как отсутствие реальных вызовов: модель отказалась от инструментов.
+        var allPlaceholder = reply.ToolCalls.All(c => IsPlaceholderToolName(c.Name));
+
+        // Если модель прислала JSON-план со списком подзадач — загружаем его в
+        // планировщик и начинаем выполнение с первой.
+        if (_planner is null && allPlaceholder && string.IsNullOrWhiteSpace(reply.Text.Trim()))
         {
+            screen.Write("Модель не смогла выполнить задачу за один ход — предлагаю разбить на подзадачи.", ConsoleColor.Yellow);
+            var planPrompt = new ChatMessage
+            {
+                Role = "user",
+                Content = JsonValue.Create(
+                    "Ты не можешь выполнить эту задачу за один ответ, потому что она слишком большая. " +
+                    "Разбей её на подзадачи и верни JSON-план:\n" +
+                    "{\"subtasks\":[{\"title\":\"...\",\"description\":\"...\"}, ...]}\n\n" +
+                    "Каждая подзадача — это отдельный шаг, который клиент будет выполнять по очереди.")
+            };
+            history.Add(planPrompt);
+            Wire.TraceId = turnId;
+            Wire.Write("turn", "noop received · asking model for decomposition plan");
+            continue; // next loop iteration will ask model for the plan
+        }
+
+        if (_planner is null && !reply.HasToolCalls)
+        {
+            var maybePlan = TryExtractPlan(reply.Text);
+            if (maybePlan is not null)
+            {
+                _planner = maybePlan;
+                screen.Write("План принят. Подзадач: " + _planner.Total, ConsoleColor.Yellow);
+                screen.Write(_planner.PlanSummary(), ConsoleColor.DarkGray);
+
+                var assistantContent = new JsonArray();
+                if (reply.Text.Trim().Length > 0)
+                    assistantContent.Add(new JsonObject { ["type"] = "text", ["text"] = reply.Text });
+                history.Add(new ChatMessage { Role = "assistant", Content = assistantContent });
+
+                Wire.TraceId = turnId;
+                Wire.Write("turn", "plan loaded · {0} subtasks · continuing with subtask execution", _planner.Total);
+                continue; // next loop iteration will pick up the first subtask
+            }
+        }
+
+        if (!reply.HasToolCalls || allPlaceholder)
+        {
+            // Если модель вернула пустой noop-вызов без текста — она не справилась с
+            // задачей за один ход. Предлагаем ей разбить задачу на подзадачи.
+            if (_planner is null && string.IsNullOrWhiteSpace(reply.Text.Trim()))
+            {
+                screen.Write("Модель не смогла выполнить задачу за один ход — предлагаю разбить на подзадачи.", ConsoleColor.Yellow);
+                var planPrompt = new ChatMessage
+                {
+                    Role = "user",
+                    Content = JsonValue.Create(
+                        "Ты не можешь выполнить эту задачу за один ответ, потому что она слишком большая. " +
+                        "Разбей её на подзадачи и верни JSON-план:\n" +
+                        "{\"subtasks\":[{\"title\":\"...\",\"description\":\"...\"}, ...]}\n\n" +
+                        "Каждая подзадача — это отдельный шаг, который клиент будет выполнять по очереди.")
+                };
+                history.Add(planPrompt);
+                Wire.TraceId = turnId;
+                Wire.Write("turn", "noop received · asking model for decomposition plan");
+                continue;
+            }
+
+            if (_planner is not null)
+            {
+                // Модель закончила текущую подзадачу (текст без вызовов инструментов).
+                _planner.MarkCurrentDone(reply.Text.Trim());
+                screen.Write($"Подзадача {_planner.Current?.Index ?? _planner.Total} готова.", ConsoleColor.Green);
+
+                var assistantContent = new JsonArray();
+                if (reply.Text.Trim().Length > 0)
+                    assistantContent.Add(new JsonObject { ["type"] = "text", ["text"] = reply.Text });
+                history.Add(new ChatMessage { Role = "assistant", Content = assistantContent });
+
+                if (_planner.HasNext)
+                {
+                    Wire.TraceId = turnId;
+                    Wire.Write("turn", "subtask done · continuing with subtask {0}/{1}",
+                        _planner.Current!.Index + 1, _planner.Total);
+                    continue; // execute next subtask
+                }
+
+                screen.Write("Все подзадачи выполнены.", ConsoleColor.Green);
+                _planner = null;
+
+                // Back to the turn id: the step loop overwrote it.
+                Wire.TraceId = turnId;
+                Wire.Write("turn", "done · all subtasks complete · {0} steps · {1} msgs in history", step + 1, history.Count);
+                Wire.Timing("turn.end", turnClock, "finished");
+                return;
+            }
+
             if (reply.Text.Trim().Length > 0)
                 await RevealAsync(reply.Text.Trim());
             history.Add(new ChatMessage { Role = "assistant", Content = JsonValue.Create(reply.Text) });
@@ -209,13 +327,13 @@ async Task RunTurnAsync()
             return;
         }
 
-        var assistantContent = new JsonArray();
+        var assistantContent2 = new JsonArray();
         if (reply.Text.Trim().Length > 0)
-            assistantContent.Add(new JsonObject { ["type"] = "text", ["text"] = reply.Text });
+            assistantContent2.Add(new JsonObject { ["type"] = "text", ["text"] = reply.Text });
 
         foreach (var call in reply.ToolCalls)
         {
-            assistantContent.Add(new JsonObject
+            assistantContent2.Add(new JsonObject
             {
                 ["type"] = "tool_use",
                 ["id"] = call.Id,
@@ -223,7 +341,7 @@ async Task RunTurnAsync()
                 ["input"] = JsonNode.Parse(string.IsNullOrWhiteSpace(call.Arguments) ? "{}" : call.Arguments),
             });
         }
-        history.Add(new ChatMessage { Role = "assistant", Content = assistantContent });
+        history.Add(new ChatMessage { Role = "assistant", Content = assistantContent2 });
 
         var results = new JsonArray();
         var stop = false;
@@ -285,6 +403,7 @@ async Task RunTurnAsync()
 
                 var toolClock = System.Diagnostics.Stopwatch.StartNew();
                 var result = await tools.ExecuteAsync(call);
+                if (result.IsError) Sound.Error(); else Sound.Success();
                 Wire.Timing("tool.done", toolClock, "{0} · is_error={1} · {2} chars of output",
                     call.Name, result.IsError, result.Output.Length);
                 Wire.Block("tool.output", result.Output);
@@ -406,6 +525,33 @@ static string Trim(string value, int max)
     return single.Length > max ? single[..max] + "..." : single;
 }
 
+/// <summary>
+/// Пытается извлечь JSON-план со списком подзадач из текста ответа модели.
+/// Ожидается формат {"subtasks":[{"title":"...","description":"..."}, ...]}.
+/// JSON может быть обёрнут в markdown-блок ```json ... ```.
+/// </summary>
+static TaskPlanner? TryExtractPlan(string text)
+{
+    if (string.IsNullOrWhiteSpace(text)) return null;
+
+    try
+    {
+        var start = text.IndexOf('{');
+        var end = text.LastIndexOf('}');
+        if (start < 0 || end <= start) return null;
+
+        var json = text[start..(end + 1)];
+        var planner = new TaskPlanner();
+        planner.LoadFromPlan(json);
+        if (planner.Total == 0) return null;
+        return planner;
+    }
+    catch
+    {
+        return null;
+    }
+}
+
 async Task RevealAsync(string text)
 {
     const int chunk = 3;
@@ -482,6 +628,10 @@ async Task<bool> RunCommandAsync(ParsedInput parsed)
 
         case "/clear":
             ClearConversation();
+            return true;
+
+        case "/plan":
+            await PlanCurrentTaskAsync();
             return true;
 
         case "/models":
@@ -902,6 +1052,43 @@ void Reconnect()
     RefreshHeader();
 }
 
+async Task PlanCurrentTaskAsync()
+{
+    // Находим последнее сообщение пользователя в истории.
+    var lastUserMsg = history.LastOrDefault(m => m.Role == "user");
+    if (lastUserMsg is null)
+    {
+        screen.Write("Нет сообщений пользователя в истории.", ConsoleColor.Red);
+        return;
+    }
+
+    var userText = lastUserMsg.Content.ToString();
+    screen.Write("Прошу модель разбить задачу на подзадачи...", ConsoleColor.Yellow);
+
+    var planPrompt = new ChatMessage
+    {
+        Role = "user",
+        Content = JsonValue.Create(
+            "Разбей эту задачу на подзадачи и верни JSON-план:\n" +
+            "{\"subtasks\":[{\"title\":\"...\",\"description\":\"...\"}, ...]}\n\n" +
+            "Задача пользователя:\n" + userText + "\n\n" +
+            "Каждая подзадача — отдельный шаг, который клиент будет выполнять по очереди.\n" +
+            "Не пытайся выполнить задачу за один ответ — только план.")
+    };
+    history.Add(planPrompt);
+
+    try
+    {
+        await RunTurnAsync();
+    }
+    catch (Exception ex)
+    {
+        Sound.Error();
+        screen.Write("error: " + ex.Message, ConsoleColor.Red);
+        Wire.Write("turn.err", "{0}: {1}", ex.GetType().Name, ex.Message);
+    }
+}
+
 void PrintConfig()
 {
     foreach (var setting in Setting.All)
@@ -934,3 +1121,46 @@ void ShowHelp()
     screen.Write("barrier: [Enter] run  [s] step  [e] edit  [q] stop", ConsoleColor.DarkGray);
     screen.Write("keys: Up/Down history | Esc clear input", ConsoleColor.DarkGray);
 }
+
+/// <summary>
+/// Проверяет, является ли имя инструмента placeholder-именем (отказом от вызова).
+/// Совпадает со списком в серверном ToolCallParser.IsPlaceholderName.
+/// </summary>
+static bool IsPlaceholderToolName(string name)
+{
+    var token = name.Trim().Trim('"', '\'');
+    if (token.Length == 0) return true;
+    return token.Equals("none", StringComparison.OrdinalIgnoreCase) ||
+           token.Equals("null", StringComparison.OrdinalIgnoreCase) ||
+           token.Equals("nil", StringComparison.OrdinalIgnoreCase) ||
+           token.Equals("no_tool", StringComparison.OrdinalIgnoreCase) ||
+           token.Equals("no_tool_available", StringComparison.OrdinalIgnoreCase) ||
+           token.Equals("no_tools_available", StringComparison.OrdinalIgnoreCase) ||
+           token.Equals("no-op", StringComparison.OrdinalIgnoreCase) ||
+           token.Equals("noop", StringComparison.OrdinalIgnoreCase);
+}
+
+static class Sound
+{
+    private static readonly bool _isWindows = OperatingSystem.IsWindows();
+
+    public static void Notify() => Play("Asterisk");
+    public static void Success() => Play("Beep");
+    public static void Error() => Play("Hand");
+
+    private static void Play(string sound)
+    {
+        if (!_isWindows) { Console.Beep(); return; }
+        try
+        {
+            var asm = Assembly.Load("System.Media");
+            var type = asm.GetType("System.Media.SystemSounds")!;
+            var prop = type.GetProperty(sound, BindingFlags.Public | BindingFlags.Static)!;
+            var soundObj = prop.GetValue(null)!;
+            var playMethod = soundObj.GetType().GetMethod("Play", BindingFlags.Public | BindingFlags.Instance)!;
+            playMethod.Invoke(soundObj, null);
+        }
+        catch { Console.Beep(); }
+    }
+}
+    

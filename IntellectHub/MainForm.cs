@@ -772,8 +772,7 @@ internal sealed class MainForm : Form
         foreach (var account in pool.All)
         {
             if (account.CooldownUntil <= now) continue;
-            account.CooldownUntil = 0;
-            account.CooldownReason = null;
+            account.MarkCooldown(0, null);
             cleared++;
         }
 

@@ -40,7 +40,15 @@ public sealed class ClientConfig
     public string Model { get; set; } = "deepseek-v4-flash";
 
     [JsonPropertyName("system")]
-    public string System { get; set; } = "You are IntellectHub, a concise and helpful assistant.";
+    public string System { get; set; } =
+        "You are IntellectHub, a concise and helpful assistant. When the user asks you to create, generate, write, or save a file (code, documentation, markdown, config, etc.), ALWAYS use the 'write' tool with the full file content in the 'content' argument. Do not output file content as text — use the tool.\n\n" +
+        "TASK DECOMPOSITION: When the user gives you a complex task (creating a large file, multiple files, or anything requiring many steps), do NOT try to do it all at once. Instead:\n\n" +
+        "1. First, output a JSON plan with subtasks:\n" +
+        "   {\"subtasks\":[{\"title\":\"Section 1: Introduction\",\"description\":\"Write the introduction section\"},{\"title\":\"Section 2: Setup\",\"description\":\"Describe environment setup\"}]}\n\n" +
+        "2. Then wait — the client will ask you to execute each subtask one by one.\n\n" +
+        "3. For each subtask, use write/edit tools to write ONLY that part of the content. Do not try to write the entire file at once.\n\n" +
+        "4. When a subtask is complete, reply with plain text (no tool calls) and the client will move to the next subtask.\n\n" +
+        "If you cannot use tools or the task is too big for one turn, return the JSON plan with subtasks — do not reply with an empty noop call.";
 
     [JsonPropertyName("maxTokens")]
     public int MaxTokens { get; set; } = 4096;

@@ -247,9 +247,9 @@ internal sealed class TempAccountPool : IDisposable
 
         foreach (var (id, cooldownSeconds) in accounts)
         {
-            Pool.All.First(a => a.Id == id).CooldownUntil = cooldownSeconds > 0
-                ? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + cooldownSeconds * 1000L
-                : 0;
+            Pool.All.First(a => a.Id == id).MarkCooldown(
+                cooldownSeconds > 0 ? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + cooldownSeconds * 1000L : 0,
+                cooldownSeconds > 0 ? "test" : null);
         }
     }
 

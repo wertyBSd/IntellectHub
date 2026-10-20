@@ -2,6 +2,9 @@ using System.Runtime.InteropServices;
 using System.Text;
 using Spectre.Console;
 using Spectre.Console.Rendering;
+using Color = Spectre.Console.Color;
+using SpectrePanel = Spectre.Console.Panel;
+using SpectrePadding = Spectre.Console.Padding;
 
 namespace IntellectHub.Client;
 
@@ -403,11 +406,11 @@ public sealed class Ui : IDisposable
         rows.Add(new Markup("  [grey]PgUp/PgDn   scroll[/]"));
         rows.Add(new Markup("  [grey]Esc        clear input[/]"));
 
-        return new Panel(new Rows(rows))
+        return new SpectrePanel(new Rows(rows))
         {
             Border = BoxBorder.Rounded,
             BorderStyle = new Style(Color.Grey),
-            Padding = new Padding(1, 0, 1, 0),
+            Padding = new SpectrePadding(1, 0, 1, 0),
         };
     }
 
@@ -430,12 +433,12 @@ public sealed class Ui : IDisposable
             ? new PanelHeader($" conversation  ↑ {_scrollFromBottom} ", Justify.Left)
             : new PanelHeader(" conversation ", Justify.Left);
 
-        return new Panel(new Rows(rows))
+        return new SpectrePanel(new Rows(rows))
         {
             Border = BoxBorder.Rounded,
             BorderStyle = new Style(Color.Grey),
             Header = header,
-            Padding = new Padding(1, 0, 1, 0),
+            Padding = new SpectrePadding(1, 0, 1, 0),
         };
     }
 
@@ -506,7 +509,7 @@ public sealed class Ui : IDisposable
         try { return Console.WindowHeight; } catch { return 32; }
     }
 
-    private static Color ToColor(ConsoleColor color) => color switch
+    private static Spectre.Console.Color ToColor(ConsoleColor color) => color switch
     {
         ConsoleColor.Black => Color.Black,
         ConsoleColor.DarkRed => Color.Maroon,

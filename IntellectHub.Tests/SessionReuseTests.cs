@@ -190,8 +190,8 @@ public sealed class SessionReuseTests
         // A DeepSeek chat belongs to the login that created it; continuing it from
         // another login would either fail or cross-contaminate two accounts.
         // Force the pool onto the other login so the guard is actually exercised.
-        temp.Pool.All.First(a => a.Id == "a").CooldownUntil =
-            DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + 60_000;
+        temp.Pool.All.First(a => a.Id == "a").MarkCooldown(
+            DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + 60_000, "test");
 
         await service.CompleteAsync(Turn("agent-1",
             Msg("user", "первый"), Msg("assistant", "ответ 1"), Msg("user", "второй")),

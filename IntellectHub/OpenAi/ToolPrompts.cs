@@ -9,7 +9,7 @@ namespace IntellectHub;
 /// </summary>
 internal static class ToolPrompts
 {
-    public static string FormatToolDefinitions(IReadOnlyList<ToolDefinition> tools, int promptBudget)
+    public static string FormatToolDefinitions(IReadOnlyList<ToolDefinition> tools, int promptBudget, bool searchEnabled = false)
     {
         if (tools.Count == 0) return "";
 
@@ -29,15 +29,25 @@ internal static class ToolPrompts
         text.AppendLine();
         text.AppendLine("--- TOOLS ---");
         text.AppendLine("Two actions, never mixed in one reply.");
-        text.AppendLine(
-            "Web: DeepSeek Search is already on. Answer in plain text with the findings. Do not use bash, curl, websearch, or webfetch for the web, and do not say you lack web access.");
+        if (searchEnabled)
+        {
+            text.AppendLine(
+                "Web: DeepSeek Search is already on. Answer in plain text with the findings. Do not use bash, curl, websearch, or webfetch for the web, and do not say you lack web access.");
+        }
+        else
+        {
+            text.AppendLine(
+                "Web: this model does not have web search. Answer from what you already know. Do not call web_search or any other built-in web tool.");
+        }
         text.AppendLine(
             "This computer: request local tools and nothing else. One call, or several independent calls together:");
         text.AppendLine("{\"tool_call\":{\"name\":\"<function_name>\",\"arguments\":{...}}}");
         text.AppendLine(
             "{\"tool_calls\":[{\"name\":\"<function_name>\",\"arguments\":{...}},{\"name\":\"<function_name>\",\"arguments\":{...}}]}");
         text.AppendLine(
-            "The gateway runs them and sends the outputs back. Do not invent those outputs. Keep arguments short.");
+            "The gateway runs them and sends the outputs back. Do not invent those outputs.");
+        text.AppendLine(
+            "If a file is large, write it in several calls: first create it, then append with edit.");
         text.AppendLine();
         text.AppendLine("Available functions:");
 
@@ -65,14 +75,18 @@ internal static class ToolPrompts
     }
 
     /// <summary>A short restatement of the tool rules, pinned to the end of the prompt.</summary>
-    public static string FormatToolReminder(IReadOnlyList<ToolDefinition> tools)
+    public static string FormatToolReminder(IReadOnlyList<ToolDefinition> tools, bool searchEnabled = false)
     {
         var names = ToolFunctionNames(tools);
         if (names.Count == 0) return "";
 
+        var webLine = searchEnabled
+            ? "Web: answer in text. DeepSeek Search is already on. Do not use bash or curl for the web."
+            : "Web: this model has no web search. Answer from what you already know. Do not call web_search.";
+
         return string.Join('\n',
             "--- TOOL REMINDER ---",
-            "Web: answer in text. DeepSeek Search is already on. Do not use bash or curl for the web.",
+            webLine,
             "This computer: output only {\"tool_call\":{\"name\":\"<function_name>\",\"arguments\":{...}}} or {\"tool_calls\":[{\"name\":\"<function_name>\",\"arguments\":{...}}]}. Do not paste source files or diffs. Do not call execute_code.",
             "Available tools: " + string.Join(", ", names),
             "--- END TOOL REMINDER ---");
@@ -111,10 +125,10 @@ internal static class ToolPrompts
     }
 
     public static string MalformedMarkupRepairPrompt =>
-        "[STRICT INSTRUCTION] Your previous response contained incomplete tool-call markup. Keep arguments short and output ONLY strict JSON: {\"tool_call\":{\"name\":\"<function>\",\"arguments\":{...}}}";
+        "[STRICT INSTRUCTION] Your previous response contained incomplete tool-call markup. Keep arguments short and output ONLY strict JSON: {\"tool_call\":{\"name\":\"<function>\",\"arguments\":{...}}}. Do NOT use 'no_tool' as the function name.";
 
     public static string CodeDumpRepairPrompt =>
-        "[STRICT INSTRUCTION] You pasted source code as plain text. This gateway cannot apply pasted files. Request exactly one tool to write or edit the file. Output ONLY strict JSON: {\"tool_call\":{\"name\":\"<function>\",\"arguments\":{...}}}. Put file contents in the tool arguments, not in markdown fences.";
+        "[STRICT INSTRUCTION] You pasted source code as plain text. This gateway cannot apply pasted files. Request exactly one tool to write or edit the file. Output ONLY strict JSON: {\"tool_call\":{\"name\":\"<function>\",\"arguments\":{...}}}. Put file contents in the tool arguments, not in markdown fences. Do NOT use 'no_tool' as the function name.";
 
     public static string AbandonedToolRepairPrompt =>
         "[STRICT INSTRUCTION] You stopped after a tool result. Continue the task. Output exactly one gateway tool request as {\"tool_call\":{\"name\":\"<function>\",\"arguments\":{...}}} or a complete final answer if the work is finished.";

@@ -67,11 +67,15 @@ internal static class Wire
     static Wire()
     {
         _flushTimer = new System.Threading.Timer(_ => Flush(), null, 300, 300);
-        AppDomain.CurrentDomain.ProcessExit += (_, _) => Flush();
+        AppDomain.CurrentDomain.ProcessExit += (_, _) =>
+        {
+            _flushTimer?.Dispose();
+            Flush();
+        };
     }
 
     /// <summary>Where the trace lands. Surfaced in the UI console on first write.</summary>
-    public static string LogDirectory { get; } = ResolveDirectory();
+    public static string LogDirectory { get; } = ResolveAndEnsureDirectory();
 
     /// <summary>Full path of the active file, or null when nothing could be opened.</summary>
     public static string? FilePath { get; private set; }
@@ -336,6 +340,22 @@ internal static class Wire
         }
 
         return Path.Combine(Path.GetTempPath(), "IntellectHub-debug");
+    }
+
+    private static string ResolveAndEnsureDirectory()
+    {
+        var dir = ResolveDirectory();
+        try
+        {
+            Directory.CreateDirectory(dir);
+        }
+        catch
+        {
+            // If even the fallback fails, use temp path
+            dir = Path.Combine(Path.GetTempPath(), "IntellectHub-debug");
+            try { Directory.CreateDirectory(dir); } catch { }
+        }
+        return dir;
     }
 }
 #else
