@@ -7,10 +7,18 @@ using IntellectHub.Client;
 
 var config = ClientConfig.Load();
 
+if (args.Length > 0 && args[0] is "--version" or "-v")
+{
+    Console.WriteLine($"IntellectHub.Client {Banner.Version}");
+    return;
+}
+
 if (args.Length > 0 && args[0] is "--help" or "-h")
 {
     Console.WriteLine("IntellectHub Console - a Claude-style terminal client");
     Console.WriteLine("usage: IntellectHub.Client [--url <server>] [--model <name>] [--project <path>] [--yes|--approve ask|writes|all]");
+    Console.WriteLine("       inside the client: F1 help, Ctrl+K commands, Ctrl+O settings, Shift+Tab approvals");
+    Console.WriteLine($"version: {Banner.Version}");
     Console.WriteLine($"config: {ClientConfig.ConfigPath}");
     return;
 }
@@ -19,8 +27,8 @@ for (var i = 0; i + 1 < args.Length; i++)
 {
     switch (args[i])
     {
-        case "--url" or "-u": config.BaseUrl = args[i + 1]; break;
-        case "--model" or "-m": config.Model = args[i + 1]; break;
+        case "--url" or "-u": config.OverrideBaseUrl(args[i + 1]); break;
+        case "--model" or "-m": config.OverrideModel(args[i + 1]); break;
         case "--project" or "-p": config.Project = args[i + 1]; break;
 
         // The short flag people reach for first, and the explicit form for a
@@ -35,12 +43,12 @@ for (var i = 0; i + 1 < args.Length; i++)
                 string.Equals(x.Name, args[i + 1], StringComparison.OrdinalIgnoreCase));
             if (named is not null)
             {
-                config.BaseUrl = named.Url;
+                config.OverrideBaseUrl(named.Url);
                 config.ServerName = named.Name;
             }
             else
             {
-                config.BaseUrl = args[i + 1];
+                config.OverrideBaseUrl(args[i + 1]);
                 config.ServerName = "";
             }
             break;
@@ -74,20 +82,28 @@ var sessionKey = NewSessionKey();
 var project = Project.Open(ResolveProjectRoot());
 var tools = new ToolRegistry(project.Root);
 var log = new SessionLog(project.LogPath);
+RememberProject(project.Root);
 
 // Планировщик подзадач: когда модель возвращает JSON-план со списком подзадач,
 // клиент выполняет их по очереди, один за другим.
 TaskPlanner? _planner = null;
 
 RefreshHeader();
-screen.Write("IntellectHub Console — type a message, or /help for commands.", ConsoleColor.DarkGray);
+screen.Write("IntellectHub Console — type a message, press F1 for help, or Ctrl+K for commands.", ConsoleColor.DarkGray);
 screen.Write("");
 await CheckHealthAsync();
 
 while (true)
 {
-    var input = screen.ReadLine();
-    if (input is null) break;
+    var line = screen.ReadLine();
+    if (line.Action == PromptAction.Exit) break;
+    if (line.Action == PromptAction.CycleApprovals)
+    {
+        CycleApprovals();
+        continue;
+    }
+
+    var input = line.Text;
     if (input.Length == 0) continue;
 
     // Anything with a leading slash is the shell's business.
@@ -103,10 +119,11 @@ while (true)
             continue;
     }
 
-    screen.Write("you > " + input, ConsoleColor.Cyan);
+    screen.Write(input, ConsoleColor.White, EntryStyle.User);
     screen.Write("");
     log.User(input);
     history.Add(new ChatMessage { Role = "user", Content = JsonValue.Create(input) });
+    UpdateUsage();
 
     try
     {
@@ -115,11 +132,12 @@ while (true)
     catch (Exception ex)
     {
         Sound.Error();
-        screen.Write("error: " + ex.Message, ConsoleColor.Red);
+        screen.Write("error: " + ex.Message, ConsoleColor.Red, EntryStyle.Error);
         Wire.Write("turn.err", "{0}: {1}", ex.GetType().Name, ex.Message);
         Wire.Block("turn.err.st", ex.ToString());
     }
 
+    UpdateUsage();
     screen.Write("");
 }
 
@@ -149,6 +167,7 @@ void ClearConversation()
     history.Clear();
     sessionKey = NewSessionKey();
     screen.Clear();
+    UpdateUsage();
     Wire.TraceId = null;
     Wire.Write("session.reset", "transcript cleared locally · new gateway session key {0}", sessionKey);
 }
@@ -156,7 +175,37 @@ void ClearConversation()
 void RefreshHeader()
 {
     screen.SetHeader(Banner.Header(config, project));
+    screen.SetContext(
+        config.Model,
+        config.ServerLabel,
+        Banner.ProjectLabel(project.Root),
+        config.Approvals.ToString().ToLowerInvariant());
     screen.SetTools(tools.Specs.Select(spec => spec.Name));
+    UpdateUsage();
+}
+
+void UpdateUsage()
+{
+    var tokens = 0;
+    foreach (var message in history)
+        tokens += (message.Content?.ToJsonString().Length ?? 0) / 4;
+    screen.SetUsage(history.Count, tokens);
+}
+
+/// <summary>
+/// Remembers a workspace for the project picker. Newest first, capped so the list
+/// stays a picker rather than an archive.
+/// </summary>
+void RememberProject(string root)
+{
+    var before = config.RecentProjects.ToList();
+    config.RecentProjects.RemoveAll(p => string.Equals(p, root, StringComparison.OrdinalIgnoreCase));
+    config.RecentProjects.Insert(0, root);
+    if (config.RecentProjects.Count > 8)
+        config.RecentProjects.RemoveRange(8, config.RecentProjects.Count - 8);
+
+    if (!before.SequenceEqual(config.RecentProjects))
+        config.Save();
 }
 
 async Task RunTurnAsync()
@@ -389,8 +438,7 @@ async Task RunTurnAsync()
                 {
                     if (reply.Text.Trim().Length > 0)
                     {
-                        screen.Write("thought", ConsoleColor.DarkGray);
-                        screen.Write("  " + reply.Text.Trim(), ConsoleColor.DarkCyan);
+                        screen.Write(reply.Text.Trim(), ConsoleColor.DarkCyan, EntryStyle.Thought);
                         screen.Write("");
                     }
                     showedAutoThought = true;
@@ -412,10 +460,16 @@ async Task RunTurnAsync()
                 if (choice == BarrierChoice.Edit)
                 {
                     call = EditCall(call);
+                    screen.Write(Describe(call), ConsoleColor.White, EntryStyle.Tool);
                     Wire.Write("barrier.edit", "{0} → new arguments", call.Name);
                     Wire.Json("barrier.edit.args", call.Arguments);
                     continue;
                 }
+
+                // The barrier already showed the call when a person approved it.
+                // Unattended calls would otherwise run silently, so they print here.
+                if (autoApproved)
+                    screen.Write(Describe(call), ConsoleColor.White, EntryStyle.Tool);
 
                 log.Action(call.Name, call.Arguments);
                 Wire.Write("tool", "→ {0} · project={1}", call.Name, project.Root);
@@ -430,9 +484,8 @@ async Task RunTurnAsync()
 
                 log.Result(result.Output);
 
-                screen.Write($"  {(result.IsError ? "x" : "ok")} {call.Name}",
-                    result.IsError ? ConsoleColor.Red : ConsoleColor.DarkGray);
-                screen.Write(Fold(result.Output), ConsoleColor.DarkGray);
+                screen.Write((result.IsError ? "error · " : "ok · ") + Fold(result.Output),
+                    result.IsError ? ConsoleColor.Red : ConsoleColor.DarkGray, EntryStyle.ToolOutput);
 
                 results.Add(new JsonObject
                 {
@@ -495,10 +548,10 @@ ToolCall EditCall(ToolCall call)
 
     screen.Write($"  {argName} [{Trim(current, 200)}]", ConsoleColor.DarkGray);
     var edited = screen.ReadLine($"{argName} > ");
-    if (edited is null or "") return call;
+    if (edited.Action == PromptAction.Exit || edited.Text.Length == 0) return call;
 
     var node = JsonNode.Parse(string.IsNullOrWhiteSpace(call.Arguments) ? "{}" : call.Arguments) as JsonObject ?? new JsonObject();
-    node[argName] = edited;
+    node[argName] = edited.Text;
     return new ToolCall { Id = call.Id, Name = call.Name, Arguments = node.ToJsonString() };
 }
 
@@ -577,11 +630,11 @@ async Task RevealAsync(string text)
     const int chunk = 3;
     if (text.Length <= chunk)
     {
-        screen.Write(text, ConsoleColor.White);
+        screen.Write(text, ConsoleColor.White, EntryStyle.Assistant);
         return;
     }
 
-    screen.BeginStream(ConsoleColor.White);
+    screen.BeginStream(ConsoleColor.White, EntryStyle.Assistant);
     for (var i = 0; i < text.Length; i += chunk)
     {
         screen.PushStream(text.Substring(i, Math.Min(chunk, text.Length - i)));
@@ -621,15 +674,50 @@ async Task CheckHealthAsync()
 
 async Task ShowModelsAsync()
 {
+    IReadOnlyList<string> models;
     try
     {
-        var models = await api.ListModelsAsync();
-        screen.Write(models.Count == 0 ? "(no models)" : string.Join("\n", models));
+        models = await api.ListModelsAsync();
     }
     catch (Exception ex)
     {
-        screen.Write("error: " + ex.Message, ConsoleColor.Red);
+        screen.Write("error: " + ex.Message, ConsoleColor.Red, EntryStyle.Error);
+        return;
     }
+
+    if (models.Count == 0)
+    {
+        screen.Write("(no models)", ConsoleColor.DarkGray);
+        return;
+    }
+
+    if (!screen.IsInteractive)
+    {
+        screen.Write(string.Join("\n", models));
+        return;
+    }
+
+    var current = models.ToList().FindIndex(m => string.Equals(m, config.Model, StringComparison.OrdinalIgnoreCase));
+    var items = models
+        .Select(m => new PickItem(m, null, string.Equals(m, config.Model, StringComparison.OrdinalIgnoreCase) ? "current" : null))
+        .ToList();
+
+    var picked = screen.Pick("models", items, "↑↓ move · ⏎ use model · Esc close", Math.Max(0, current));
+    if (picked is null) return;
+
+    var model = models[picked.Value];
+    if (string.Equals(model, config.Model, StringComparison.OrdinalIgnoreCase))
+    {
+        screen.Write($"model is already {model}", ConsoleColor.DarkGray);
+        return;
+    }
+
+    config.Model = model;
+    config.Save();
+    RefreshHeader();
+    Wire.TraceId = null;
+    Wire.Write("model", "{0}", model);
+    screen.Write($"model = {model}", ConsoleColor.Green, EntryStyle.Notice);
 }
 
 /// <summary>
@@ -703,7 +791,7 @@ void ReportUnknownCommand(ParsedInput parsed)
 
         if (verb.Length == 0)
         {
-            ShowServers();
+            await PickServerAsync();
             return;
         }
 
@@ -786,6 +874,70 @@ void ReportUnknownCommand(ParsedInput parsed)
         screen.Write("  /connect forget <name>", ConsoleColor.DarkGray);
     }
 
+    /// <summary>
+    /// The no-argument form of /connect. Saved gateways are the list; typing an
+    /// address and saving one are rows at the bottom rather than separate commands.
+    /// </summary>
+    async Task PickServerAsync()
+    {
+        if (!screen.IsInteractive)
+        {
+            ShowServers();
+            return;
+        }
+
+        var items = new List<PickItem>();
+        foreach (var server in config.Servers)
+        {
+            var active = string.Equals(server.Name, config.ServerName, StringComparison.OrdinalIgnoreCase);
+            items.Add(new PickItem(server.Name, server.Url, active ? "active" : null, active));
+        }
+
+        var customAt = items.Count;
+        items.Add(new PickItem("custom address…", "type a URL and switch to it"));
+        var saveAt = items.Count;
+        items.Add(new PickItem("save current…", "remember the current address under a name"));
+
+        var picked = screen.Pick("servers", items, "↑↓ move · ⏎ select · Esc close");
+        if (picked is null) return;
+
+        if (picked.Value == saveAt)
+        {
+            var name = screen.ReadLine("save as > ");
+            if (name.Action == PromptAction.Exit || name.Text.Length == 0) return;
+            SaveServer(name.Text + " " + config.BaseUrl);
+            return;
+        }
+
+        if (picked.Value == customAt)
+        {
+            var answer = screen.ReadLine("server > ", config.BaseUrl);
+            if (answer.Action == PromptAction.Exit || answer.Text.Length == 0) return;
+
+            var setting = Setting.Find("server");
+            var error = setting?.Validate(answer.Text);
+            if (error is not null)
+            {
+                screen.Write(error, ConsoleColor.Red, EntryStyle.Error);
+                return;
+            }
+
+            setting!.Write(config, answer.Text);
+            config.ServerName = "";
+            config.Save();
+            AfterServerChange($"custom → {config.BaseUrl}");
+            await CheckHealthAsync();
+            return;
+        }
+
+        var chosen = config.Servers[picked.Value];
+        config.BaseUrl = chosen.Url;
+        config.ServerName = chosen.Name;
+        config.Save();
+        AfterServerChange($"{chosen.Name} → {chosen.Url}");
+        await CheckHealthAsync();
+    }
+
     void SaveServer(string arguments)
     {
         var (name, url) = Split(arguments);
@@ -866,6 +1018,31 @@ void SetApprovals(string arguments)
 {
     if (arguments.Length == 0)
     {
+        PickApprovals();
+        return;
+    }
+
+    // An unrecognised word must not land on Ask: silently tightening the barrier
+    // is the worst possible reading of "yes".
+    if (!Enum.TryParse<Approvals>(arguments.Trim(), true, out _) && !IsAffirmative(arguments))
+    {
+        screen.Write($"unknown approval mode '{arguments}'", ConsoleColor.Red, EntryStyle.Error);
+        screen.Write("use ask, writes or all", ConsoleColor.DarkGray);
+        return;
+    }
+
+    config.ApprovalMode = ToolRisk.Normalize(arguments);
+    ApplyApprovals(config.Approvals);
+}
+
+/// <summary>
+/// The no-argument form of /approve, also reached with Shift+Tab: a three-row list
+/// so the middle mode can be picked without remembering its spelling.
+/// </summary>
+void PickApprovals()
+{
+    if (!screen.IsInteractive)
+    {
         screen.Write($"  approvals  {config.Approvals}", ConsoleColor.Cyan);
         screen.Write($"  {ToolRisk.Describe(config.Approvals)}", ConsoleColor.DarkGray);
         screen.Write("  change it with /approve ask, /approve writes or /approve all", ConsoleColor.DarkGray);
@@ -875,24 +1052,42 @@ void SetApprovals(string arguments)
         return;
     }
 
-    // An unrecognised word must not land on Ask: silently tightening the barrier
-    // is the worst possible reading of "yes".
-    if (!Enum.TryParse<Approvals>(arguments.Trim(), true, out _) && !IsAffirmative(arguments))
-    {
-        screen.Write($"unknown approval mode '{arguments}'", ConsoleColor.Red);
-        screen.Write("use ask, writes or all", ConsoleColor.DarkGray);
-        return;
-    }
+    var modes = new[] { Approvals.Ask, Approvals.Writes, Approvals.All };
+    var items = modes
+        .Select(m => new PickItem(
+            m.ToString().ToLowerInvariant(),
+            ToolRisk.Describe(m),
+            m == config.Approvals ? "current" : null,
+            m == config.Approvals))
+        .ToList();
 
-    config.ApprovalMode = ToolRisk.Normalize(arguments);
+    var picked = screen.Pick("approvals", items, "↑↓ move · ⏎ use mode · Esc close", (int)config.Approvals);
+    if (picked is null) return;
+    ApplyApprovals(modes[picked.Value]);
+}
+
+void ApplyApprovals(Approvals mode)
+{
+    config.ApprovalMode = mode.ToString();
     config.Save();
     RefreshHeader();
 
     Wire.TraceId = null;
-    Wire.Write("approvals", "{0} · {1}", config.Approvals, ToolRisk.Describe(config.Approvals));
+    Wire.Write("approvals", "{0} · {1}", mode, ToolRisk.Describe(mode));
 
-    screen.Write($"approvals = {config.Approvals}", ConsoleColor.Green);
-    screen.Write($"  {ToolRisk.Describe(config.Approvals)}", ConsoleColor.DarkGray);
+    screen.Write($"approvals = {mode.ToString().ToLowerInvariant()} · {ToolRisk.Describe(mode)}",
+        ConsoleColor.Green, EntryStyle.Notice);
+}
+
+void CycleApprovals()
+{
+    var next = config.Approvals switch
+    {
+        Approvals.Ask => Approvals.Writes,
+        Approvals.Writes => Approvals.All,
+        _ => Approvals.Ask,
+    };
+    ApplyApprovals(next);
 }
 
 static bool IsAffirmative(string value) =>
@@ -902,16 +1097,60 @@ async Task SelectProjectAsync(string arguments)
 {
     if (arguments.Length == 0)
     {
+        await PickProjectAsync();
+        return;
+    }
+
+    await SwitchProjectAsync(arguments);
+}
+
+/// <summary>
+/// The no-argument form of /project: current, recent workspaces, then a path.
+/// </summary>
+async Task PickProjectAsync()
+{
+    if (!screen.IsInteractive)
+    {
         screen.Write($"  current [{project.Root}]", ConsoleColor.DarkGray);
         screen.Write("  switch it with /project <path>", ConsoleColor.DarkGray);
         return;
     }
 
+    var items = new List<PickItem>
+    {
+        new("(current)", project.Root, "active", true),
+    };
+
+    foreach (var path in config.RecentProjects)
+    {
+        if (string.Equals(path, project.Root, StringComparison.OrdinalIgnoreCase)) continue;
+        items.Add(new PickItem(Banner.ProjectLabel(path), path));
+    }
+
+    var customAt = items.Count;
+    items.Add(new PickItem("enter a path…", "switch to a folder that is not listed"));
+
+    var picked = screen.Pick("project", items, "↑↓ move · ⏎ open · Esc close");
+    if (picked is null || picked.Value == 0) return;
+
+    if (picked.Value == customAt)
+    {
+        var answer = screen.ReadLine("path > ", project.Root);
+        if (answer.Action == PromptAction.Exit || answer.Text.Length == 0) return;
+        await SwitchProjectAsync(answer.Text);
+        return;
+    }
+
+    await SwitchProjectAsync(items[picked.Value].Detail ?? items[picked.Value].Label);
+}
+
+async Task SwitchProjectAsync(string path)
+{
     await Task.Yield();
 
     try
     {
-        project = Project.Open(arguments);
+        project = Project.Open(path);
         tools = new ToolRegistry(project.Root);
         log = new SessionLog(project.LogPath);
         // A new workspace means a new conversation, so the remote chat behind this
@@ -919,13 +1158,15 @@ async Task SelectProjectAsync(string arguments)
         history.Clear();
         sessionKey = NewSessionKey();
         config.Project = project.Root;
+        RememberProject(project.Root);
         config.Save();
         RefreshHeader();
         screen.Clear();
+        screen.Write($"project = {project.Root}", ConsoleColor.Green, EntryStyle.Notice);
     }
     catch (Exception ex)
     {
-        screen.Write("error: " + ex.Message, ConsoleColor.Red);
+        screen.Write("error: " + ex.Message, ConsoleColor.Red, EntryStyle.Error);
     }
 }
 
@@ -937,6 +1178,12 @@ async Task EditConfigAsync(string arguments)
 {
     if (arguments.Length == 0)
     {
+        if (screen.IsInteractive)
+        {
+            await OpenSettingsAsync();
+            return;
+        }
+
         PrintConfig();
         screen.Write("change one with /config <name> [value], or /config <name> to be asked", ConsoleColor.DarkGray);
         screen.Write("clear a value with '!', e.g. /config key !", ConsoleColor.DarkGray);
@@ -969,11 +1216,61 @@ async Task EditConfigAsync(string arguments)
         screen.Write($"  now: {Trim(setting.Display(config), 160)}", ConsoleColor.DarkGray);
         if (setting.Clearable) screen.Write("  type ! to clear", ConsoleColor.DarkGray);
 
-        value = screen.ReadLine($"{setting.Name} > ");
-        if (value is null or "") return;
+        value = screen.ReadLine($"{setting.Name} > ", Editable(setting, config)).Text;
+        if (value.Length == 0) return;
     }
 
     await ApplySettingAsync(setting, value);
+}
+
+/// <summary>
+/// The settings screen. Every change is validated and written immediately, so
+/// there is no separate save step to forget and no way to lose an edit by leaving.
+/// The list stays open after a change: adjusting server, model and approvals is
+/// one visit rather than three commands.
+/// </summary>
+async Task OpenSettingsAsync()
+{
+    var selected = 0;
+    while (true)
+    {
+        var items = Setting.All
+            .Select(s => new PickItem(s.Name, s.Hint, Trim(s.Display(config), 34)))
+            .ToList();
+        items.Add(new PickItem("reset to defaults", "restore server, model, tokens, temperature and system prompt"));
+
+        var picked = screen.Pick("settings", items, "↑↓ move · ⏎ edit · Esc close · changes save immediately", selected);
+        if (picked is null) return;
+
+        selected = picked.Value;
+        if (selected >= Setting.All.Count)
+        {
+            await ResetSettingsAsync("");
+            selected = 0;
+            continue;
+        }
+
+        var setting = Setting.All[selected];
+
+        // Lists beat typing for the two settings that only have a handful of
+        // valid values. The settings screen stays open behind them.
+        if (setting.Name == "model")
+        {
+            await ShowModelsAsync();
+            continue;
+        }
+        if (setting.Name == "approvals")
+        {
+            PickApprovals();
+            continue;
+        }
+
+        var answer = screen.ReadLine($"{setting.Name} > ", Editable(setting, config));
+        if (answer.Action == PromptAction.Exit) return;
+        if (answer.Text.Length == 0) continue;
+
+        await ApplySettingAsync(setting, answer.Text);
+    }
 }
 
 async Task ApplySettingAsync(Setting setting, string value)
@@ -1012,9 +1309,10 @@ async Task ApplySettingAsync(Setting setting, string value)
 void Commit(Setting setting, string shown)
 {
     config.Save();
+    RefreshHeader();
     Wire.TraceId = null;
     Wire.Write("config", "{0} = {1}", setting.Name, shown);
-    screen.Write($"{setting.Name} = {Trim(shown, 160)}", ConsoleColor.Green);
+    screen.Write($"{setting.Name} = {Trim(shown, 160)}", ConsoleColor.Green, EntryStyle.Notice);
     screen.Write("saved to " + ClientConfig.ConfigPath, ConsoleColor.DarkGray);
 }
 
@@ -1030,8 +1328,9 @@ async Task ResetSettingsAsync(string name)
         config.Temperature = fresh.Temperature;
         // The key is left alone on purpose: silently dropping a working credential
         // is a worse outcome than leaving a stale one, and /config key ! clears it.
+        config.Save();
         Reconnect();
-        screen.Write("settings restored to defaults (key left as it was)", ConsoleColor.Green);
+        screen.Write("settings restored to defaults (key left as it was)", ConsoleColor.Green, EntryStyle.Notice);
         await CheckHealthAsync();
         return;
     }
@@ -1051,6 +1350,13 @@ async Task ResetSettingsAsync(string name)
         await CheckHealthAsync();
     }
 }
+
+/// <summary>
+/// The value the prompt starts with when editing a setting: the current one,
+/// flattened to a single line, and blank for anything secret.
+/// </summary>
+static string Editable(Setting setting, ClientConfig config) =>
+    setting.Secret ? "" : setting.Display(config).Replace('\r', ' ').Replace('\n', ' ');
 
 static (string Name, string Value) Split(string arguments)
 {
@@ -1082,7 +1388,7 @@ async Task PlanCurrentTaskAsync()
         return;
     }
 
-    var userText = lastUserMsg.Content.ToString();
+    var userText = lastUserMsg.Content?.ToString() ?? "";
     screen.Write("Прошу модель разбить задачу на подзадачи...", ConsoleColor.Yellow);
 
     var planPrompt = new ChatMessage
@@ -1104,7 +1410,7 @@ async Task PlanCurrentTaskAsync()
     catch (Exception ex)
     {
         Sound.Error();
-        screen.Write("error: " + ex.Message, ConsoleColor.Red);
+        screen.Write("error: " + ex.Message, ConsoleColor.Red, EntryStyle.Error);
         Wire.Write("turn.err", "{0}: {1}", ex.GetType().Name, ex.Message);
     }
 }
@@ -1136,10 +1442,20 @@ void ShowHelp()
     }
 
     screen.Write("");
+    screen.Write("shortcuts", ConsoleColor.White);
+    screen.Write("  ⌃K  command palette        ⌃O  settings", ConsoleColor.Cyan);
+    screen.Write("  F1  this help              ⌃L  clear conversation", ConsoleColor.Cyan);
+    screen.Write("  ⇧⇥  cycle approvals        ⌃B  show/hide side rail", ConsoleColor.Cyan);
+    screen.Write("  ⌃T  tool output on/off     ⌃C  clear input, then exit", ConsoleColor.Cyan);
+    screen.Write("  ↑↓  history                Tab complete commands and values", ConsoleColor.Cyan);
+    screen.Write("  PgUp/PgDn scroll           Esc clear input", ConsoleColor.Cyan);
+
+    screen.Write("");
+    screen.Write("typed without a value, these open a list: /config /models /connect /project /approve",
+        ConsoleColor.DarkGray);
     screen.Write("settings: " + string.Join(", ", Setting.All.Select(s => s.Name)), ConsoleColor.DarkGray);
     screen.Write("tools: " + string.Join(", ", tools.Specs.Select(s => s.Name)), ConsoleColor.DarkGray);
-    screen.Write("barrier: [Enter] run  [s] step  [e] edit  [q] stop", ConsoleColor.DarkGray);
-    screen.Write("keys: Up/Down history | Esc clear input", ConsoleColor.DarkGray);
+    screen.Write("barrier: [⏎] run  [s] step  [e] edit  [q] stop", ConsoleColor.DarkGray);
 }
 
 /// <summary>

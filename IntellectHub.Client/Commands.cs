@@ -73,11 +73,11 @@ internal static class CommandLine
     public static IReadOnlyList<Command> Known { get; } =
     [
         new("/help",     "/help",              "show this help", ["/h", "/?"]),
-        new("/models",   "/models",            "list models the server offers"),
-        new("/config",   "/config [name] [value]", "view or change settings", ["/cfg", "/settings"]),
-        new("/connect",  "/connect [name|url|save|forget]", "switch gateway", ["/server", "/url"]),
-        new("/approve",  "/approve [ask|writes|all]", "how much runs without asking", ["/approvals"]),
-        new("/project",  "/project [path]",    "switch the working project", ["/cd"]),
+        new("/models",   "/models",            "choose a model from the server's list"),
+        new("/config",   "/config [name] [value]", "settings menu; edit without typing a value", ["/cfg", "/settings"]),
+        new("/connect",  "/connect [name|url|save|forget]", "switch gateway from the saved list or a URL", ["/server", "/url"]),
+        new("/approve",  "/approve [ask|writes|all]", "what runs without asking; Shift+Tab cycles", ["/approvals"]),
+        new("/project",  "/project [path]",    "switch workspace from recent folders", ["/cd"]),
         new("/clear",    "/clear",             "clear the conversation", ["/reset"]),
         new("/plan",     "/plan",              "break current task into subtasks", ["/decompose"]),
         new("/exit",     "/exit",              "leave", ["/quit", "/q"]),

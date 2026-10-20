@@ -60,6 +60,13 @@ public sealed class ClientConfig
     public string? Project { get; set; }
 
     /// <summary>
+    /// Projects switched to recently, newest first. The project picker is built
+    /// from this so returning to a workspace is one keypress instead of a path.
+    /// </summary>
+    [JsonPropertyName("recentProjects")]
+    public List<string> RecentProjects { get; set; } = [];
+
+    /// <summary>
     /// How much of the agent's work runs without stopping. Stored as text so the
     /// value stays readable in client.json.
     /// </summary>
@@ -70,13 +77,26 @@ public sealed class ClientConfig
     public Approvals Approvals => ToolRisk.Parse(ApprovalMode);
 
     [JsonIgnore]
-    public static string ConfigDir =>
+    public static string ConfigDir { get; internal set; } =
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "IntellectHub");
 
     [JsonIgnore]
-    public static string ConfigPath => Path.Combine(ConfigDir, "client.json");
+    public static string ConfigPath { get; internal set; } = Path.Combine(ConfigDir, "client.json");
 
     private static readonly JsonSerializerOptions Json = new() { WriteIndented = true };
+
+    // Environment variables are per-process overrides. Saving must not turn them
+    // into the stored configuration: one run with IH_BASE_URL set would otherwise
+    // rewrite the file and leave the client pointing at that address forever.
+    private bool _envBaseUrl;
+    private string? _envBaseUrlValue;
+    private string? _storedBaseUrl;
+    private bool _envApiKey;
+    private string? _envApiKeyValue;
+    private string? _storedApiKey;
+    private bool _envModel;
+    private string? _envModelValue;
+    private string? _storedModel;
 
     public static ClientConfig Load()
     {
@@ -87,7 +107,14 @@ public sealed class ClientConfig
             {
                 var json = File.ReadAllText(ConfigPath);
                 var loaded = JsonSerializer.Deserialize<ClientConfig>(json);
-                if (loaded is not null) config = loaded;
+                if (loaded is not null)
+                {
+                    config = loaded;
+                    // A hand-edited file can carry "servers": null. Treat that as an
+                    // empty list rather than letting the first switch throw.
+                    config.Servers ??= [];
+                    config.RecentProjects ??= [];
+                }
             }
             catch (Exception ex)
             {
@@ -96,18 +123,63 @@ public sealed class ClientConfig
         }
 
         var envUrl = Environment.GetEnvironmentVariable("IH_BASE_URL");
-        if (!string.IsNullOrWhiteSpace(envUrl)) config.BaseUrl = envUrl;
+        if (!string.IsNullOrWhiteSpace(envUrl))
+        {
+            config._storedBaseUrl = config.BaseUrl;
+            config._envBaseUrlValue = envUrl;
+            config._envBaseUrl = true;
+            config.BaseUrl = envUrl;
+        }
+
         var envKey = Environment.GetEnvironmentVariable("IH_API_KEY");
-        if (!string.IsNullOrWhiteSpace(envKey)) config.ApiKey = envKey;
+        if (!string.IsNullOrWhiteSpace(envKey))
+        {
+            config._storedApiKey = config.ApiKey;
+            config._envApiKeyValue = envKey;
+            config._envApiKey = true;
+            config.ApiKey = envKey;
+        }
+
         var envModel = Environment.GetEnvironmentVariable("IH_MODEL");
-        if (!string.IsNullOrWhiteSpace(envModel)) config.Model = envModel;
+        if (!string.IsNullOrWhiteSpace(envModel))
+        {
+            config._storedModel = config.Model;
+            config._envModelValue = envModel;
+            config._envModel = true;
+            config.Model = envModel;
+        }
 
         return config;
+    }
+
+    /// <summary>Applies a command-line address, which outranks the environment for this run.</summary>
+    public void OverrideBaseUrl(string url)
+    {
+        BaseUrl = url;
+        _envBaseUrl = false;
+    }
+
+    /// <summary>Applies a command-line model, which outranks the environment for this run.</summary>
+    public void OverrideModel(string model)
+    {
+        Model = model;
+        _envModel = false;
     }
 
     public void Save()
     {
         Directory.CreateDirectory(ConfigDir);
-        File.WriteAllText(ConfigPath, JsonSerializer.Serialize(this, Json));
+
+        // Keep the values that came from the file for anything still sitting at an
+        // environment override. A value changed at runtime is persisted as usual.
+        var stored = (ClientConfig)MemberwiseClone();
+        if (_envBaseUrl && string.Equals(BaseUrl, _envBaseUrlValue, StringComparison.Ordinal))
+            stored.BaseUrl = _storedBaseUrl ?? stored.BaseUrl;
+        if (_envApiKey && string.Equals(ApiKey, _envApiKeyValue, StringComparison.Ordinal))
+            stored.ApiKey = _storedApiKey;
+        if (_envModel && string.Equals(Model, _envModelValue, StringComparison.Ordinal))
+            stored.Model = _storedModel ?? stored.Model;
+
+        File.WriteAllText(ConfigPath, JsonSerializer.Serialize(stored, Json));
     }
 }

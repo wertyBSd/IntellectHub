@@ -1,45 +1,30 @@
 using Spectre.Console;
 using Spectre.Console.Rendering;
-using SpectrePanel = Spectre.Console.Panel;
 using SpectreColor = Spectre.Console.Color;
-using SpectrePadding = Spectre.Console.Padding;
 
 namespace IntellectHub.Client;
 
 public static class Banner
 {
-    public const string Version = "0.3.1";
+    public const string Version = "0.4.0";
 
-    private static readonly string[] Logo =
-    {
-        "╲   │   ╱",
-        "────◆────",
-        "╱   │   ╲",
-    };
-
+    /// <summary>
+    /// A compact, quiet header: identity on the left, where it is talking to on the
+    /// right. The old boxed banner repeated the server and project on every frame;
+    /// this keeps one line for each so the conversation gets the height instead.
+    /// </summary>
     public static IRenderable Header(ClientConfig config, Project project)
     {
-        var logo = new Markup(string.Join('\n', Logo.Select(line => $"[aqua]{Markup.Escape(line)}[/]")));
+        var title = new Markup(
+            $"[gold1]✻[/] [bold white]Intellect Hub[/] [grey]v{Version}[/]   " +
+            $"[silver]{Markup.Escape(config.Model)}[/] [grey]·[/] " +
+            $"[silver]{Markup.Escape(ProjectLabel(project.Root))}[/]");
 
-        // The folder name, not the whole path. A full path is long, repeats on every
-        // redraw, and the tail is the only part that tells two projects apart.
-        var info = new Markup(
-            $"[bold white]I N T E L L E C T   H U B[/] [grey]v{Version}[/]\n" +
-            $"[grey]server [/] [gold1]{Markup.Escape(config.ServerLabel)}[/] [grey]{Markup.Escape(config.BaseUrl)}[/]  " +
-            $"[grey]model[/] [silver]{Markup.Escape(config.Model)}[/]\n" +
-            $"[grey]project[/] [silver]{Markup.Escape(ProjectLabel(project.Root))}[/]");
+        var endpoint = new Markup(
+            $"[grey]{Markup.Escape(config.ServerLabel)}[/] [grey]·[/] " +
+            $"[grey]{Markup.Escape(config.BaseUrl)}[/]");
 
-        var grid = new Grid();
-        grid.AddColumn(new GridColumn().NoWrap().Padding(0, 0, 2, 0));
-        grid.AddColumn(new GridColumn());
-        grid.AddRow(logo, info);
-
-        return new SpectrePanel(grid)
-        {
-            Border = BoxBorder.Rounded,
-            BorderStyle = new Style(SpectreColor.Gold1),
-            Padding = new SpectrePadding(1, 0, 1, 0),
-        };
+        return new Rows(title, endpoint, new Rule { Style = new Style(SpectreColor.Grey23) });
     }
 
     /// <summary>
