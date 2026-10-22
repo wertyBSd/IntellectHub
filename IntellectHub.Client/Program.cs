@@ -1,6 +1,8 @@
 using System;
+using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
+using System.Net;
 using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -99,6 +101,9 @@ bool _hasUsedWriteTools = false;
 
 // Пути к файлам, которые модель записала в текущей подзадаче (для верификации существования).
 List<string> _writtenFiles = new();
+
+// Локальный HTTP-сервер для preview игры в браузере (ES-модули не работают по file://).
+PreviewServer? _previewServer = null;
 
 RefreshHeader();
 
@@ -609,7 +614,7 @@ async Task RunTurnCoreAsync(CancellationToken ct)
                 // Если модель использовала write/edit в текущей подзадаче — считаем её выполненной.
                 if (_planner is not null && config.SelfCheck && HasUsedWriteTools())
                 {
-                    if (!TryCompleteCurrentSubtask(reply.Text.Trim(), turnId, history))
+                    if (!await TryCompleteCurrentSubtask(reply.Text.Trim(), turnId, history))
                     {
                         continue; // retry: файлы не найдены, повторим запрос
                     }
@@ -893,7 +898,7 @@ async Task RunTurnCoreAsync(CancellationToken ct)
         // Если модель использовала write/edit для текущей подзадача — завершаем её.
         if (_planner is not null && config.SelfCheck && HasUsedWriteTools())
         {
-            if (!TryCompleteCurrentSubtask("", turnId, history))
+            if (!await TryCompleteCurrentSubtask("", turnId, history))
             {
                 continue; // повторить запрос: файлы не найдены
             }
@@ -1215,6 +1220,10 @@ async Task<bool> RunCommandAsync(ParsedInput parsed)
 
         case "/mode":
             ModeCommandAsync(parsed.Arguments);
+            return true;
+
+        case "/preview":
+            await PreviewCommandAsync(parsed.Arguments);
             return true;
 
         default:
@@ -2086,6 +2095,112 @@ void ShowModeStatus()
     screen.Write("  /mode next · /mode reset · /mode status", ConsoleColor.DarkGray);
 }
 
+async Task PreviewCommandAsync(string arguments)
+{
+    var (path, rest) = Split(arguments);
+
+    if (path.Equals("errors", StringComparison.OrdinalIgnoreCase))
+    {
+        await PreviewErrorsAsync();
+        return;
+    }
+
+    var target = path.Length > 0 ? path : "index.html";
+
+    var projectRoot = project?.Root ?? Directory.GetCurrentDirectory();
+    var filePath = Path.GetFullPath(Path.Combine(projectRoot, target));
+
+    if (!File.Exists(filePath))
+    {
+        screen.Write($"файл не найден: {filePath}", ConsoleColor.Red);
+        screen.Write("доступные файлы: " + string.Join(", ", Directory.GetFiles(projectRoot, "*.html")
+            .Select(f => Path.GetFileName(f))), ConsoleColor.DarkGray);
+        return;
+    }
+
+    // Остановим старый сервер, если был.
+    _previewServer?.Dispose();
+
+    // Находим свободный порт и стартуем сервер.
+    _previewServer = new PreviewServer(projectRoot, 0);
+    _previewServer.Start();
+
+    // Очищаем старые JS-ошибки.
+    _previewServer.ClearErrors();
+
+    var url = _previewServer.BaseUrl + Path.GetFileName(filePath);
+
+    screen.Write($"preview сервер запущен на http://127.0.0.1:{_previewServer.Port}", ConsoleColor.Cyan);
+    screen.Write($"открываю: {url}", ConsoleColor.Cyan);
+
+    try
+    {
+        Process.Start(new ProcessStartInfo
+        {
+            FileName = url,
+            UseShellExecute = true
+        });
+    }
+    catch (Exception ex)
+    {
+        screen.Write("не удалось открыть браузер автоматически: " + ex.Message, ConsoleColor.Red);
+        screen.Write("откройте вручную: " + url, ConsoleColor.Yellow);
+    }
+
+    screen.Write("проверьте консоль браузера (F12 → Console) на наличие JS-ошибок.", ConsoleColor.DarkGray);
+    screen.Write("команда /preview errors покажет ошибки, перехваченные сервером.", ConsoleColor.DarkGray);
+}
+
+async Task PreviewErrorsAsync()
+{
+    if (_previewServer is null)
+    {
+        screen.Write("preview сервер не запущен. Сначала выполните /preview", ConsoleColor.Red);
+        return;
+    }
+
+    // Дадим серверу секунду накопить ошибки.
+    await Task.Delay(1500);
+
+    var errors = _previewServer.JsErrors;
+    if (errors.Count == 0)
+    {
+        screen.Write("JS-ошибок не перехвачено.", ConsoleColor.Green);
+        return;
+    }
+
+    screen.Write($"перехвачено JS-ошибок: {errors.Count}", ConsoleColor.Red);
+    foreach (var err in errors.Take(10))
+        screen.Write("  " + err, ConsoleColor.DarkGray);
+}
+
+async Task<bool> VerifyGameWorksViaPreview(string htmlFileName, string traceId)
+{
+    if (_previewServer is null)
+    {
+        // Сервер не запущен — не можем верифицировать, пропускаем проверку.
+        return true;
+    }
+
+    var url = _previewServer.BaseUrl + htmlFileName;
+    screen.Write($"верификация через preview: {url}", ConsoleColor.DarkGray);
+
+    // Даём браузеру время загрузить страницу и выполнить скрипты.
+    await Task.Delay(3000);
+
+    var errors = _previewServer.JsErrors;
+    if (errors.Count > 0)
+    {
+        screen.Write("верификация не пройдена: JS-ошибки в браузере", ConsoleColor.Red);
+        foreach (var err in errors.Take(5))
+            screen.Write("  " + err, ConsoleColor.DarkGray);
+        return false;
+    }
+
+    screen.Write("верификация пройдена: JS-ошибок не обнаружено.", ConsoleColor.Green);
+    return true;
+}
+
 async Task PlanCurrentTaskAsync()
 {
     // Находим последнее сообщение пользователя в истории.
@@ -2235,7 +2350,7 @@ bool VerifyWrittenFiles()
     /// подзадачу как выполненную. Возвращает false, если нужен repeat-запрос
     /// (файлы не найдены и попытки не исчерпаны).
     /// </summary>
-    bool TryCompleteCurrentSubtask(string assistantText, string traceId, List<ChatMessage> history)
+    async Task<bool> TryCompleteCurrentSubtask(string assistantText, string traceId, List<ChatMessage> history)
     {
         var currentSubtask = _planner!.Current!;
 
@@ -2275,8 +2390,46 @@ bool VerifyWrittenFiles()
         }
         else
         {
+            // Верифицируем, что игра работает в браузере (нет JS-ошибок),
+            // прежде чем помечать подзадачу как выполненную.
+            var htmlFile = _writtenFiles.FirstOrDefault(f => f.EndsWith(".html", StringComparison.OrdinalIgnoreCase))
+                ?? "index.html";
+            if (!await VerifyGameWorksViaPreview(htmlFile, traceId))
+            {
+                currentSubtask.Attempts++;
+                const int maxAttempts = 3;
+                if (currentSubtask.Attempts >= maxAttempts)
+                {
+                    screen.Write($"Подзадача {currentSubtask.Index + 1} не выполнена после {maxAttempts} попыток (ошибки в браузере) — пропускаем.", ConsoleColor.Red);
+                    _planner.MarkCurrentFailed("JS errors in browser preview after multiple attempts.");
+                    Wire.TraceId = traceId;
+                    Wire.Write("turn", "subtask {0} failed (browser errors) · skipping", currentSubtask.Index + 1);
+                    var failContent = new JsonArray();
+                    failContent.Add(new JsonObject { ["type"] = "text", ["text"] = $"[Подзадача {currentSubtask.Index + 1} не выполнена — ошибки в браузере]" });
+                    history.Add(new ChatMessage { Role = "assistant", Content = failContent });
+                    return true;
+                }
+                else
+                {
+                    screen.Write($"Подзадача {currentSubtask.Index + 1}: ошибки в браузере, повторяем (попытка {currentSubtask.Attempts}/{maxAttempts}).", ConsoleColor.Yellow);
+                    var retryPrompt = new ChatMessage
+                    {
+                        Role = "user",
+                        Content = JsonValue.Create(
+                            $"Ты должен исправить ошибки в браузере для подзадачи {currentSubtask.Index + 1} из {_planner.Total}: \"{currentSubtask.Title}\".\n\n" +
+                            $"Описание: {currentSubtask.Description}\n\n" +
+                            $"После записи файлов проверь, что игра запускается без JS-ошибок в консоли браузера. " +
+                            $"ИСПОЛЬЗУЙ ИНСТРУМЕНТЫ write/edit для исправления кода.")
+                    };
+                    history.Add(retryPrompt);
+                    Wire.TraceId = traceId;
+                    Wire.Write("turn", "subtask {0} browser errors · retrying (attempt {1}/{2})", currentSubtask.Index + 1, currentSubtask.Attempts, maxAttempts);
+                    return false;
+                }
+            }
+
             _planner.MarkCurrentDone(assistantText);
-            screen.Write($"Подзадача {currentSubtask.Index + 1} готова (инструменты использованы, файлы проверены).", ConsoleColor.Green);
+            screen.Write($"Подзадача {currentSubtask.Index + 1} готова (инструменты использованы, файлы проверены, браузер ОК).", ConsoleColor.Green);
             return true;
         }
     }

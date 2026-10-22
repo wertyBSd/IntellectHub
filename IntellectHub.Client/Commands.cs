@@ -81,6 +81,7 @@ internal static class CommandLine
         new("/clear",    "/clear",             "clear the conversation", ["/reset"]),
         new("/plan",     "/plan",              "break current task into subtasks", ["/decompose"]),
         new("/mode",     "/mode [architect|code|debug|orchestrator|next|reset|status]", "переключить режим разработки и показать состояние модов", ["/m"]),
+        new("/preview",  "/preview [path]", "открыть проект в браузере через локальный сервер и проверить JS-ошибки", ["/view", "/browser"]),
         new("/exit",     "/exit",              "leave", ["/quit", "/q"]),
     ];
 
