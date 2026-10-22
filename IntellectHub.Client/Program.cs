@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
@@ -314,7 +314,7 @@ async Task RunTurnCoreAsync(CancellationToken ct)
                 Content = JsonValue.Create(
                     $"Выполни подзадачу {subtask.Index + 1} из {_planner.Total}: {subtask.Title}\n\n" +
                     $"Описание: {subtask.Description}\n\n" +
-                    $"ИСПОЛЬЗУЙ ИНСТРУМЕНТЫ write/edit, чтобы записать свою часть результата в файл docs/manual.md. " +
+                    $"ИСПОЛЬЗУЙ ИНСТРУМЕНТЫ write/edit, чтобы записать свою часть результата в соответствующие файлы проекта. " +
                     $"НЕ ВЫВОДИ ТЕКСТ В ОТВЕТЕ — используй инструменты для записи в файл. " +
                     $"НЕ ПИШИ СКРИПТЫ В ОТВЕТЕ — используй инструмент bash для выполнения команд. " +
                     $"Не пытайся сделать всё за один вызов — пиши только эту часть. " +
@@ -340,7 +340,7 @@ async Task RunTurnCoreAsync(CancellationToken ct)
             {
                 try
                 {
-                    reply = await api.SendAsync(_modes?.WithContext(history) ?? history, tools.Specs, traceId, sessionKey, ct);
+                    reply = await api.SendAsync(_modes?.WithContext(history) ?? history, tools.Specs, traceId, sessionKey, ModelRole.Default, ct);
                     Sound.Notify();
                     lastTransient = null;
                     break;
@@ -552,7 +552,7 @@ async Task RunTurnCoreAsync(CancellationToken ct)
                                 Content = JsonValue.Create(
                                     $"Ты должен написать содержимое подзадачи {currentSubtask.Index + 1} из {_planner.Total}: \"{currentSubtask.Title}\".\n\n" +
                                     $"Описание: {currentSubtask.Description}\n\n" +
-                                    $"ИСПОЛЬЗУЙ ИНСТРУМЕНТЫ write/edit, чтобы записать содержимое в файл docs/manual.md. " +
+                                    $"ИСПОЛЬЗУЙ ИНСТРУМЕНТЫ write/edit, чтобы записать содержимое в соответствующие файлы проекта. " +
                                     $"НЕ ВЫВОДИ ТЕКСТ В ОТВЕТЕ — используй инструменты для записи в файл. " +
                                     $"НЕ ПИШИ СКРИПТЫ В ОТВЕТЕ — используй инструмент bash для выполнения команд.")
                             };
@@ -1073,12 +1073,19 @@ async Task RevealAsync(string text)
 
 async Task CheckHealthAsync()
 {
+    var baseUrl = config.BaseUrl ?? "";
+    var isOpenAICompatible = baseUrl.Contains("openrouter", StringComparison.OrdinalIgnoreCase)
+                          || baseUrl.Contains("deepseek", StringComparison.OrdinalIgnoreCase)
+                          || baseUrl.Contains("localhost:11434", StringComparison.OrdinalIgnoreCase)
+                          || baseUrl.Contains("127.0.0.1:11434", StringComparison.OrdinalIgnoreCase)
+                          || baseUrl.Contains(":11434", StringComparison.OrdinalIgnoreCase);
+
     var isLocal = config.BaseUrl.StartsWith("http://127.0.0.1") ||
                   config.BaseUrl.StartsWith("http://localhost");
 
-    if (!isLocal)
+    if (!isLocal || isOpenAICompatible)
     {
-        // External providers (Google, Anthropic, OpenAI, etc.) don't have a /health
+        // External providers (Google, Anthropic, OpenAI, Ollama, etc.) don't have a /health
         // endpoint. Just confirm the address is configured.
         screen.Write("connected to " + config.BaseUrl, ConsoleColor.DarkGray);
         Wire.TraceId = null;
@@ -2352,109 +2359,89 @@ bool VerifyWrittenFiles()
     /// </summary>
     async Task<bool> TryCompleteCurrentSubtask(string assistantText, string traceId, List<ChatMessage> history)
     {
-        var currentSubtask = _planner!.Current!;
+        // Сначала верифицируем файлы через helper
+        var fileResult = SubtaskHelpers.TryCompleteSubtask(
+            _planner!,
+            screen,
+            traceId,
+            history,
+            VerifyWrittenFiles(),
+            "файлы не созданы",
+            SubtaskHelpers.FilesMissingRetryFactory(_planner!),
+            "инструменты использованы, файлы проверены"
+        );
 
-        if (!VerifyWrittenFiles())
-        {
-            currentSubtask.Attempts++;
-            const int maxAttempts = 3;
-            if (currentSubtask.Attempts >= maxAttempts)
-            {
-                screen.Write($"Подзадача {currentSubtask.Index + 1} не выполнена после {maxAttempts} попыток (файлы не созданы) — пропускаем.", ConsoleColor.Red);
-                _planner.MarkCurrentFailed("Written files do not exist after multiple attempts.");
-                Wire.TraceId = traceId;
-                Wire.Write("turn", "subtask {0} failed (files missing) · skipping", currentSubtask.Index + 1);
-                var failContent = new JsonArray();
-                failContent.Add(new JsonObject { ["type"] = "text", ["text"] = $"[Подзадача {currentSubtask.Index + 1} не выполнена — файлы не созданы]" });
-                history.Add(new ChatMessage { Role = "assistant", Content = failContent });
-                return true; // подзадача помечена как Failed — можно переходить к следующей
-            }
-            else
-            {
-                screen.Write($"Подзадача {currentSubtask.Index + 1}: файлы не найдены на диске, повторяем (попытка {currentSubtask.Attempts}/{maxAttempts}).", ConsoleColor.Yellow);
-                var retryPrompt = new ChatMessage
-                {
-                    Role = "user",
-                    Content = JsonValue.Create(
-                        $"Ты должен записать файлы для подзадачи {currentSubtask.Index + 1} из {_planner.Total}: \"{currentSubtask.Title}\".\n\n" +
-                        $"Описание: {currentSubtask.Description}\n\n" +
-                        $"ИСПОЛЬЗУЙ ИНСТРУМЕНТЫ write/edit, чтобы создать файлы на диске. " +
-                        $"Перед завершением убедись, что файлы реально существуют. " +
-                        $"НЕ ВЫВОДИ ТЕКСТ В ОТВЕТЕ — используй инструменты.")
-                };
-                history.Add(retryPrompt);
-                Wire.TraceId = traceId;
-                Wire.Write("turn", "subtask {0} files missing · retrying (attempt {1}/{2})", currentSubtask.Index + 1, currentSubtask.Attempts, maxAttempts);
-                return false; // нужен repeat
-            }
-        }
-        else
-        {
-            // Верифицируем, что игра работает в браузере (нет JS-ошибок),
-            // прежде чем помечать подзадачу как выполненную.
-            var htmlFile = _writtenFiles.FirstOrDefault(f => f.EndsWith(".html", StringComparison.OrdinalIgnoreCase))
-                ?? "index.html";
-            if (!await VerifyGameWorksViaPreview(htmlFile, traceId))
-            {
-                currentSubtask.Attempts++;
-                const int maxAttempts = 3;
-                if (currentSubtask.Attempts >= maxAttempts)
-                {
-                    screen.Write($"Подзадача {currentSubtask.Index + 1} не выполнена после {maxAttempts} попыток (ошибки в браузере) — пропускаем.", ConsoleColor.Red);
-                    _planner.MarkCurrentFailed("JS errors in browser preview after multiple attempts.");
-                    Wire.TraceId = traceId;
-                    Wire.Write("turn", "subtask {0} failed (browser errors) · skipping", currentSubtask.Index + 1);
-                    var failContent = new JsonArray();
-                    failContent.Add(new JsonObject { ["type"] = "text", ["text"] = $"[Подзадача {currentSubtask.Index + 1} не выполнена — ошибки в браузере]" });
-                    history.Add(new ChatMessage { Role = "assistant", Content = failContent });
-                    return true;
-                }
-                else
-                {
-                    screen.Write($"Подзадача {currentSubtask.Index + 1}: ошибки в браузере, повторяем (попытка {currentSubtask.Attempts}/{maxAttempts}).", ConsoleColor.Yellow);
-                    var retryPrompt = new ChatMessage
-                    {
-                        Role = "user",
-                        Content = JsonValue.Create(
-                            $"Ты должен исправить ошибки в браузере для подзадачи {currentSubtask.Index + 1} из {_planner.Total}: \"{currentSubtask.Title}\".\n\n" +
-                            $"Описание: {currentSubtask.Description}\n\n" +
-                            $"После записи файлов проверь, что игра запускается без JS-ошибок в консоли браузера. " +
-                            $"ИСПОЛЬЗУЙ ИНСТРУМЕНТЫ write/edit для исправления кода.")
-                    };
-                    history.Add(retryPrompt);
-                    Wire.TraceId = traceId;
-                    Wire.Write("turn", "subtask {0} browser errors · retrying (attempt {1}/{2})", currentSubtask.Index + 1, currentSubtask.Attempts, maxAttempts);
-                    return false;
-                }
-            }
-
-            _planner.MarkCurrentDone(assistantText);
-            screen.Write($"Подзадача {currentSubtask.Index + 1} готова (инструменты использованы, файлы проверены, браузер ОК).", ConsoleColor.Green);
+        if (fileResult == SubtaskCompletionResult.Retry)
+            return false;
+        if (fileResult == SubtaskCompletionResult.Failed)
             return true;
-        }
+
+        // Файлы есть — дополнительно верифицируем браузер (если есть HTML)
+        var htmlFile = _writtenFiles.FirstOrDefault(f => f.EndsWith(".html", StringComparison.OrdinalIgnoreCase))
+            ?? "index.html";
+        var browserOk = await VerifyGameWorksViaPreview(htmlFile, traceId);
+        
+        var browserResult = SubtaskHelpers.TryCompleteSubtask(
+            _planner!,
+            screen,
+            traceId,
+            history,
+            browserOk,
+            "ошибки в браузере",
+            SubtaskHelpers.BrowserErrorsRetryFactory(_planner!),
+            "инструменты использованы, файлы проверены, браузер ОК"
+        );
+
+        return browserResult != SubtaskCompletionResult.Retry;
     }
 
 static class Sound
 {
     private static readonly bool _isWindows = OperatingSystem.IsWindows();
+    
+    // Кэшируем делегаты для воспроизведения звуков на Windows, чтобы избежать reflection на каждый вызов
+    private static readonly Action? _playAsterisk;
+    private static readonly Action? _playBeep;
+    private static readonly Action? _playHand;
 
-    public static void Notify() => Play("Asterisk");
-    public static void Success() => Play("Beep");
-    public static void Error() => Play("Hand");
-
-    private static void Play(string sound)
+    static Sound()
     {
-        if (!_isWindows) { Console.Beep(); return; }
-        try
+        if (_isWindows)
         {
-            var asm = Assembly.Load("System.Media");
-            var type = asm.GetType("System.Media.SystemSounds")!;
-            var prop = type.GetProperty(sound, BindingFlags.Public | BindingFlags.Static)!;
-            var soundObj = prop.GetValue(null)!;
-            var playMethod = soundObj.GetType().GetMethod("Play", BindingFlags.Public | BindingFlags.Instance)!;
-            playMethod.Invoke(soundObj, null);
+            try
+            {
+                var asm = Assembly.Load("System.Media");
+                var type = asm.GetType("System.Media.SystemSounds")!;
+                var asteriskProp = type.GetProperty("Asterisk", BindingFlags.Public | BindingFlags.Static)!;
+                var beepProp = type.GetProperty("Beep", BindingFlags.Public | BindingFlags.Static)!;
+                var handProp = type.GetProperty("Hand", BindingFlags.Public | BindingFlags.Static)!;
+
+                var asteriskSound = asteriskProp.GetValue(null)!;
+                var beepSound = beepProp.GetValue(null)!;
+                var handSound = handProp.GetValue(null)!;
+
+                var playMethod = asteriskSound.GetType().GetMethod("Play", BindingFlags.Public | BindingFlags.Instance)!;
+
+                _playAsterisk = () => playMethod.Invoke(asteriskSound, null);
+                _playBeep = () => playMethod.Invoke(beepSound, null);
+                _playHand = () => playMethod.Invoke(handSound, null);
+            }
+            catch
+            {
+                // Игнорируем ошибки инициализации, используем fallback
+            }
         }
-        catch { Console.Beep(); }
+    }
+
+    public static void Notify() => Play(_playAsterisk);
+    public static void Success() => Play(_playBeep);
+    public static void Error() => Play(_playHand);
+
+    private static void Play(Action? playAction)
+    {
+        if (!_isWindows || playAction is null) { Console.Beep(); return; }
+        try { playAction(); } catch { Console.Beep(); }
     }
 }
     
+

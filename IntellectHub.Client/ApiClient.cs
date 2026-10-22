@@ -51,6 +51,25 @@ public sealed class ModelUnavailableException : Exception
     public string? Suggestion { get; }
 }
 
+/// <summary>
+/// Роль модели в мультимодельном пайплайне.
+/// </summary>
+public enum ModelRole
+{
+    /// <summary>Основная модель (по умолчанию).</summary>
+    Default,
+    /// <summary>Планирование и декомпозиция задач.</summary>
+    Planning,
+    /// <summary>Построение Repo Map и анализ кодовой базы.</summary>
+    RepoMap,
+    /// <summary>Генерация и редактирование кода.</summary>
+    Coding,
+    /// <summary>Отладка и исправление ошибок.</summary>
+    Debug,
+    /// <summary>Ответы пользователю в чате.</summary>
+    Chat,
+}
+
 public sealed class ApiClient : IDisposable
 {
     private readonly HttpClient _http;
@@ -58,12 +77,14 @@ public sealed class ApiClient : IDisposable
     private readonly ConnectionEntry? _connection;
     private readonly ProviderKind _provider;
     private readonly string _model;
+    private readonly ModelRoleConfig _modelRoles;
 
     public ApiClient(ClientConfig config, ConnectionEntry? connection = null)
     {
         _config = config;
         _connection = connection;
         _provider = connection?.Provider ?? ProviderKind.Anthropic;
+        _modelRoles = config.ModelRoles ?? new ModelRoleConfig();
 
         // A named connection carries its own address; otherwise the address comes
         // from the configuration, which is what a hand-typed gateway looks like.
@@ -87,12 +108,12 @@ public sealed class ApiClient : IDisposable
         EffectiveKey = Environment.GetEnvironmentVariable("IH_API_KEY")
             ?? (connection is null ? config.ApiKey : ClientConfig.GetSecret(connection.CredentialKey) ?? config.ApiKey);
 
-        // Диагностика: пишем, откуда取 ключ и каковы первые 4 символа
+        // Диагностика: пишем, откуда берется ключ (маскируем значение)
         var keySource = string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("IH_API_KEY"))
             ? (connection is null ? "client.json (apiKey)" : $"secrets.json ({connection.CredentialKey})")
             : "env var IH_API_KEY";
-        Wire.Write("auth.debug", "key_source={0} · credential_key={1} · effective_key_prefix={2}",
-            keySource, connection?.CredentialKey ?? "(none)", EffectiveKey?.Substring(0, Math.Min(4, EffectiveKey.Length)) ?? "(none)");
+        Wire.Write("auth.debug", "key_source={0} · credential_key={1} · effective_key={2}",
+            keySource, connection?.CredentialKey ?? "(none)", Wire.Mask(EffectiveKey));
 
         // Если ключа нет нигде — не шлём запрос к провайдеру, а возвращаем понятную ошибку.
         if (string.IsNullOrWhiteSpace(EffectiveKey))
@@ -120,6 +141,24 @@ public sealed class ApiClient : IDisposable
 
     /// <summary>Returns the effective API key, or null if none is configured.</summary>
     public string? GetEffectiveKey() => EffectiveKey;
+
+    /// <summary>
+    /// Gets the model name for a specific role, falling back to the default model.
+    /// </summary>
+    public string GetModelForRole(ModelRole role)
+    {
+        var roleModel = role switch
+        {
+            ModelRole.Planning => _modelRoles.PlanningModel,
+            ModelRole.RepoMap => _modelRoles.RepoMapModel,
+            ModelRole.Coding => _modelRoles.CodingModel,
+            ModelRole.Debug => _modelRoles.DebugModel,
+            ModelRole.Chat => _modelRoles.ChatModel,
+            _ => null
+        };
+
+        return string.IsNullOrWhiteSpace(roleModel) ? _model : roleModel;
+    }
 
     /// <summary>
     /// Sends the credential the way the provider expects it. Each provider family
@@ -173,30 +212,25 @@ public sealed class ApiClient : IDisposable
     }
 
     /// <summary>
-    /// A GET against the native Gemini API with the default Authorization taken
-    /// off for the call: the native endpoint validates that header as an OAuth 2
-    /// token, so an API key sent as Bearer fails the request before the
-    /// x-goog-api-key credential is ever read. The header is restored afterwards
-    /// so the compatibility-layer requests keep using it.
+    /// A GET against the native Gemini API without the Authorization header:
+    /// the native endpoint validates that header as an OAuth 2 token, so an API
+    /// key sent as Bearer fails the request before the x-goog-api-key credential
+    /// is ever read. This uses HttpRequestMessage to avoid mutating
+    /// DefaultRequestHeaders (which is not thread-safe for concurrent mutation).
     /// </summary>
     private async Task<HttpResponseMessage> GetWithoutBearerAsync(string url, CancellationToken ct)
     {
-        string? bearer = null;
-        if (_http.DefaultRequestHeaders.TryGetValues("Authorization", out var values))
+        using var request = new HttpRequestMessage(HttpMethod.Get, url);
+        // Copy all default headers except Authorization
+        foreach (var header in _http.DefaultRequestHeaders)
         {
-            bearer = string.Join(", ", values);
-            _http.DefaultRequestHeaders.Remove("Authorization");
+            if (!string.Equals(header.Key, "Authorization", StringComparison.OrdinalIgnoreCase))
+            {
+                request.Headers.TryAddWithoutValidation(header.Key, header.Value);
+            }
         }
-
-        try
-        {
-            return await _http.GetAsync(url, ct);
-        }
-        finally
-        {
-            if (bearer is not null)
-                _http.DefaultRequestHeaders.TryAddWithoutValidation("Authorization", bearer);
-        }
+        // x-goog-api-key is already in default headers from ApplyAuth
+        return await _http.SendAsync(request, ct);
     }
 
     public async Task<string> HealthAsync(CancellationToken ct = default)
@@ -225,6 +259,10 @@ public sealed class ApiClient : IDisposable
         // (не OpenAI-совместимый /v1/openai/models, а /v1beta/models).
         string modelsEndpoint;
         var baseAddress = _http.BaseAddress.ToString();
+        bool isOllama = baseAddress.Contains("localhost:11434", StringComparison.OrdinalIgnoreCase)
+                     || baseAddress.Contains("127.0.0.1:11434", StringComparison.OrdinalIgnoreCase)
+                     || baseAddress.Contains(":11434", StringComparison.OrdinalIgnoreCase);
+
         if (baseAddress.Contains("googleapis", StringComparison.OrdinalIgnoreCase))
         {
             // Для Google: base = https://generativelanguage.googleapis.com/v1beta/openai
@@ -232,6 +270,19 @@ public sealed class ApiClient : IDisposable
             var baseWithoutSuffix = baseAddress.Replace("/v1beta/openai", "", StringComparison.OrdinalIgnoreCase);
             modelsEndpoint = baseWithoutSuffix.TrimEnd('/') + "/v1beta/models";
             Wire.Write("http.req", "GET v1beta/models (Google) → {0}", modelsEndpoint);
+        }
+        else if (isOllama)
+        {
+            // Ollama: native API uses /api/tags, OpenAI-compatible uses /v1/models
+            if (baseAddress.EndsWith("/v1", StringComparison.OrdinalIgnoreCase))
+            {
+                modelsEndpoint = "v1/models";
+            }
+            else
+            {
+                modelsEndpoint = "api/tags";
+            }
+            Wire.Write("http.req", "GET {0} (Ollama) → {1}", modelsEndpoint, _http.BaseAddress);
         }
         else
         {
@@ -257,6 +308,23 @@ public sealed class ApiClient : IDisposable
                 foreach (var item in models.EnumerateArray())
                     if (item.TryGetProperty("name", out var name) && name.GetString() is { } s)
                         list.Add(ModelName.Short(s));
+            }
+        }
+        else if (isOllama)
+        {
+            // Ollama: {"models":[{"name":"llama3.2:latest",...}]} (native /api/tags)
+            // or {"data":[{"id":"llama3.2:latest",...}]} (OpenAI-compatible /v1/models)
+            if (doc.RootElement.TryGetProperty("models", out var models) && models.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var item in models.EnumerateArray())
+                    if (item.TryGetProperty("name", out var name) && name.GetString() is { } s)
+                        list.Add(ModelName.Short(s));
+            }
+            else if (doc.RootElement.TryGetProperty("data", out var data) && data.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var item in data.EnumerateArray())
+                    if (item.TryGetProperty("id", out var id2) && id2.GetString() is { } s)
+                        list.Add(s);
             }
         }
         else
@@ -285,6 +353,7 @@ public sealed class ApiClient : IDisposable
         IReadOnlyList<ToolSpec>? tools,
         string traceId,
         string sessionKey,
+        ModelRole role = ModelRole.Default,
         CancellationToken ct = default)
     {
         Wire.TraceId = traceId;
@@ -302,9 +371,10 @@ public sealed class ApiClient : IDisposable
             };
         }
 
+        var model = GetModelForRole(role);
         var payload = new JsonObject
         {
-            ["model"] = ModelName.Short(_model),
+            ["model"] = ModelName.Short(model),
             ["max_tokens"] = _config.MaxTokens,
             ["temperature"] = _config.Temperature,
         };
@@ -345,21 +415,22 @@ public sealed class ApiClient : IDisposable
                 foreach (var block in jsonArray)
                 {
                     // block может быть JsonObject или иным типом
-                    var blockType = block["type"]?.GetValue<string>();
+                    if (block is not JsonObject blockObj) continue;
+                    var blockType = blockObj["type"]?.GetValue<string>();
                     if (blockType == "text")
                     {
-                        var textVal = block["text"]?.GetValue<string>();
+                        var textVal = blockObj["text"]?.GetValue<string>();
                         if (!string.IsNullOrEmpty(textVal)) parts.Add(textVal);
                     }
                     else if (blockType == "tool_use")
                     {
-                        var nameVal = block["name"]?.GetValue<string>();
+                        var nameVal = blockObj["name"]?.GetValue<string>();
                         parts.Add($"[Инструмент: {nameVal ?? "неизвестно"}]");
                     }
                     else
                     {
                         // Для неизвестных блоков добавляем сырый JSON фрагмент
-                        parts.Add(block.ToJsonString());
+                        parts.Add(blockObj.ToJsonString());
                     }
                 }
                 return string.Join("\n\n", parts);

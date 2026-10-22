@@ -97,6 +97,55 @@ public sealed class ServerEntry
     [JsonPropertyName("url")] public string Url { get; set; } = "";
 }
 
+/// <summary>
+/// Configuration for an MCP (Model Context Protocol) server.
+/// </summary>
+public sealed class McpServerConfig
+{
+    /// <summary>Command to start the MCP server (e.g., "npx", "python", "docker").</summary>
+    [JsonPropertyName("command")]
+    public string Command { get; set; } = "";
+
+    /// <summary>Arguments for the command.</summary>
+    [JsonPropertyName("args")]
+    public List<string> Args { get; set; } = new();
+
+    /// <summary>Environment variables for the server process.</summary>
+    [JsonPropertyName("env")]
+    public Dictionary<string, string> Env { get; set; } = new();
+
+    /// <summary>Whether to auto-connect on startup.</summary>
+    [JsonPropertyName("autoConnect")]
+    public bool AutoConnect { get; set; } = false;
+}
+
+/// <summary>
+/// Конфигурация ролей модели для мультимодельного пайплайна (опционально).
+/// Если роль не задана (null/пусто) — используется основная модель (model).
+/// </summary>
+public sealed class ModelRoleConfig
+{
+    /// <summary>Модель для планирования и декомпозиции задач.</summary>
+    [JsonPropertyName("planningModel")]
+    public string? PlanningModel { get; set; }
+
+    /// <summary>Модель для построения Repo Map и анализа кода.</summary>
+    [JsonPropertyName("repoMapModel")]
+    public string? RepoMapModel { get; set; }
+
+    /// <summary>Модель для генерации и редактирования кода.</summary>
+    [JsonPropertyName("codingModel")]
+    public string? CodingModel { get; set; }
+
+    /// <summary>Модель для отладки и исправления ошибок.</summary>
+    [JsonPropertyName("debugModel")]
+    public string? DebugModel { get; set; }
+
+    /// <summary>Модель для ответов пользователю (чата).</summary>
+    [JsonPropertyName("chatModel")]
+    public string? ChatModel { get; set; }
+}
+
 public sealed class ClientConfig
 {
     [JsonPropertyName("baseUrl")]
@@ -305,7 +354,9 @@ public sealed class ClientConfig
 
     [JsonPropertyName("system")]
     public string System { get; set; } =
-        "You are IntellectHub, a concise and helpful assistant. When the user asks you to create, generate, write, or save a file (code, documentation, markdown, config, etc.), ALWAYS use the 'write' tool with the full file content in the 'content' argument. Do not output file content as text — use the tool.\n\n" +
+        "You are IntellectHub, a concise and helpful assistant.\n\n" +
+        "TOOLS: Only use tools when the user explicitly asks you to create, edit, read, or modify files/code, or when you need to search/run commands. For general conversation, questions, explanations, or chat — just reply with plain text. Do NOT use tools for simple chat.\n\n" +
+        "When you DO use tools, use the proper function calling format (not markdown code blocks).\n\n" +
         "TASK DECOMPOSITION: When the user gives you a complex task (creating a large file, multiple files, or anything requiring many steps), do NOT try to do it all at once. Instead:\n\n" +
         "1. First, output a JSON plan with subtasks:\n" +
         "   {\"subtasks\":[{\"title\":\"Section 1: Introduction\",\"description\":\"Write the introduction section\"},{\"title\":\"Section 2: Setup\",\"description\":\"Describe environment setup\"}]}\n\n" +
@@ -347,6 +398,28 @@ public sealed class ClientConfig
     /// </summary>
     [JsonPropertyName("selfCheck")]
     public bool SelfCheck { get; set; } = true;
+
+    /// <summary>
+    /// Команда для авто-сборки проекта после изменений кода.
+    /// Пример: "dotnet build --no-restore", "npm run build", "pytest", "go build ./..."
+    /// Пустая строка отключает авто-валидацию.
+    /// </summary>
+    [JsonPropertyName("buildCommand")]
+    public string BuildCommand { get; set; } = "";
+
+    /// <summary>
+    /// Настройки мультимодельного пайплайна (опционально).
+    /// Если роль не задана (null/пусто) — используется основная модель.
+    /// </summary>
+    [JsonPropertyName("modelRoles")]
+    public ModelRoleConfig ModelRoles { get; set; } = new();
+
+    /// <summary>
+    /// MCP (Model Context Protocol) серверы для подключения внешних инструментов.
+    /// Каждый сервер запускается как отдельный процесс и предоставляет свои инструменты.
+    /// </summary>
+    [JsonPropertyName("mcpServers")]
+    public Dictionary<string, McpServerConfig> McpServers { get; set; } = new();
 
     [JsonIgnore]
     public static string ConfigDir { get; internal set; } =

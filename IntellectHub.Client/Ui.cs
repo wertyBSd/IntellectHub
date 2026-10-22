@@ -1527,6 +1527,255 @@ public sealed class Ui : IDisposable, IModeNotifier
         }
         catch { }
     }
+
+
+    /// <summary>
+
+    /// Renders a unified diff with color coding using Spectre.Console.
+
+    /// Returns the diff as a renderable.
+
+    /// </summary>
+
+    public static string RenderUnifiedDiff(string oldText, string newText, string? path = null, int contextLines = 3)
+
+    {
+
+        var oldLines = oldText.Split('\n');
+
+        var newLines = newText.Split('\n');
+
+        // Compute diff using a simple LCS-like approach
+
+        var diff = ComputeDiff(oldLines, newLines, contextLines);
+
+        var sb = new System.Text.StringBuilder();
+
+        if (!string.IsNullOrEmpty(path))
+
+        {
+
+            sb.AppendLine($"[bold]{Markup.Escape(path)}[/]");
+
+            sb.AppendLine();
+
+        }
+
+        foreach (var chunk in diff)
+
+        {
+
+            foreach (var line in chunk.Lines)
+
+            {
+
+                var prefix = line.Type switch
+
+                {
+
+                    DiffLineType.Context => " ",
+
+                    DiffLineType.Delete => "-",
+
+                    DiffLineType.Insert => "+",
+
+                    _ => " "
+
+                };
+
+                var color = line.Type switch
+
+                {
+
+                    DiffLineType.Context => "grey",
+
+                    DiffLineType.Delete => "red",
+
+                    DiffLineType.Insert => "green",
+
+                    _ => "white"
+
+                };
+
+                var escaped = Markup.Escape(line.Content);
+
+                sb.AppendLine($"[grey]{line.OldLineNumber,4}:{line.NewLineNumber,4}[/] [{color}]{prefix}[/][{color}]{escaped}[/]");
+
+            }
+
+        }
+
+        return sb.ToString();
+
+    }
+
+
+    private enum DiffLineType
+
+    {
+
+        Context,
+
+        Delete,
+
+        Insert
+
+    }
+
+
+    private sealed record DiffLine(int OldLineNumber, int NewLineNumber, string Content, DiffLineType Type);
+
+
+    private sealed record DiffChunk(List<DiffLine> Lines);
+
+
+    private static List<DiffChunk> ComputeDiff(string[] oldLines, string[] newLines, int contextLines)
+
+    {
+
+        // Simple LCS-based diff algorithm
+
+        var m = oldLines.Length;
+
+        var n = newLines.Length;
+
+        
+
+        // Build LCS matrix
+
+        var dp = new int[m + 1, n + 1];
+
+        for (int ii = m - 1; ii >= 0; ii--)
+
+        {
+
+            for (int jj = n - 1; jj >= 0; jj--)
+
+            {
+
+                if (oldLines[ii] == newLines[jj])
+
+                    dp[ii, jj] = 1 + dp[ii + 1, jj + 1];
+
+                else
+
+                    dp[ii, jj] = Math.Max(dp[ii + 1, jj], dp[ii, jj + 1]);
+
+            }
+
+        }
+
+        
+
+        // Reconstruct diff
+
+        var chunks = new List<DiffChunk>();
+
+        var currentChunk = new List<DiffLine>();
+
+        
+
+        int i = 0, j = 0;
+
+        int oldLineNum = 1, newLineNum = 1;
+
+        
+
+        while (i < m || j < n)
+
+        {
+
+            if (i < m && j < n && oldLines[i] == newLines[j])
+
+            {
+
+                // Context line
+
+                currentChunk.Add(new DiffLine(oldLineNum++, newLineNum++, oldLines[i], DiffLineType.Context));
+
+                i++; j++;
+
+            }
+
+            else if (j < n && (i >= m || dp[i, j + 1] >= dp[i + 1, j]))
+
+            {
+
+                // Insertion
+
+                currentChunk.Add(new DiffLine(0, newLineNum++, newLines[j], DiffLineType.Insert));
+
+                j++;
+
+            }
+
+            else
+
+            {
+
+                // Deletion
+
+                currentChunk.Add(new DiffLine(oldLineNum++, 0, oldLines[i], DiffLineType.Delete));
+
+                i++;
+
+            }
+
+            
+
+            // Check if we should finalize chunk
+
+            bool isLast = i >= m && j >= n;
+
+            bool nextIsContext = i < m && j < n && oldLines[i] == newLines[j];
+
+            
+
+            if (isLast || (currentChunk.Count > contextLines * 2 && nextIsContext))
+
+            {
+
+                // Add context lines around the chunk
+
+                var finalChunk = AddContextLines(currentChunk, oldLines, newLines, contextLines, ref oldLineNum, ref newLineNum);
+
+                chunks.Add(new DiffChunk(finalChunk));
+
+                currentChunk = new List<DiffLine>();
+
+            }
+
+        }
+
+        
+
+        if (currentChunk.Count > 0)
+
+        {
+
+            chunks.Add(new DiffChunk(AddContextLines(currentChunk, oldLines, newLines, contextLines, ref oldLineNum, ref newLineNum)));
+
+        }
+
+        
+
+        return chunks;
+
+    }
+
+
+    private static List<DiffLine> AddContextLines(List<DiffLine> chunk, string[] oldLines, string[] newLines, int contextLines, ref int oldLineNum, ref int newLineNum)
+
+    {
+
+        // This is a simplified version - just return the chunk as-is
+
+        // A full implementation would add context lines around changes
+
+        return chunk;
+
+    }
+
 }
 
 /// <summary>
