@@ -49,7 +49,7 @@ public readonly record struct PromptResult(string Text, PromptAction Action = Pr
 /// <summary>One row of an interactive picker.</summary>
 public sealed record PickItem(string Label, string? Detail = null, string? Badge = null, bool Active = false);
 
-public sealed class Ui : IDisposable
+public sealed class Ui : IDisposable, IModeNotifier
 {
     private static readonly string[] Frames = { "·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢" };
 
@@ -112,6 +112,7 @@ public sealed class Ui : IDisposable
     private string _model = "";
     private string _server = "";
     private string _project = "";
+    private string _mode = "";
     private string _approvals = "";
 
     private sealed record Entry(string Text, Color Color, EntryStyle Style, int Indent, bool Head);
@@ -141,6 +142,7 @@ public sealed class Ui : IDisposable
         string Model,
         string Server,
         string Project,
+        string Mode,
         int Messages,
         int Tokens,
         int Tools,
@@ -194,6 +196,23 @@ public sealed class Ui : IDisposable
             _project = project;
             _approvals = approvals;
         }
+    }
+
+    /// <summary>Текущий режим разработки (Orchestrator / Architect / Code / Debug).</summary>
+    public void SetMode(string mode)
+    {
+        lock (_gate) _mode = mode;
+    }
+
+    void IModeNotifier.OnModeChanged(string modeDisplay)
+    {
+        lock (_gate) _mode = modeDisplay;
+    }
+
+    void IModeNotifier.OnAnnounce(string text)
+    {
+        Write(text, ConsoleColor.Cyan, EntryStyle.Notice);
+        Write("");
     }
 
     public void SetUsage(int messages, int approxTokens)
@@ -1097,6 +1116,7 @@ public sealed class Ui : IDisposable
         _model,
         _server,
         _project,
+        _mode,
         _messages,
         _approxTokens,
         _tools.Count,
@@ -1142,6 +1162,7 @@ public sealed class Ui : IDisposable
         Value("model", _model);
         Value("server", _server);
         Value("project", _project);
+        Value("mode", _mode);
         Value("approve", _approvals);
 
         var toolRoom = inner - rows.Count - 10;

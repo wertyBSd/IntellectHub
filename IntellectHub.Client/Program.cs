@@ -1,8 +1,10 @@
+using System;
 using System.Globalization;
 using System.Linq;
 using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Threading.Tasks;
 using IntellectHub.Client;
 
 var config = ClientConfig.Load();
@@ -82,6 +84,10 @@ var sessionKey = NewSessionKey();
 var project = Project.Open(ResolveProjectRoot());
 var tools = new ToolRegistry(project.Root, config);
 var log = new SessionLog(project.LogPath);
+ModeStore? _modeStore = null;
+ModeManager? _modes = null;
+_modeStore = new ModeStore(project);
+_modes = new ModeManager(project, _modeStore, screen);
 RememberProject(project.Root);
 
 // Планировщик подзадач: когда модель возвращает JSON-план со списком подзадач,
@@ -91,7 +97,21 @@ TaskPlanner? _planner = null;
 // Self-check: отслеживаем использование инструментов write/edit для проверки выполнения подзадач.
 bool _hasUsedWriteTools = false;
 
+// Пути к файлам, которые модель записала в текущей подзадаче (для верификации существования).
+List<string> _writtenFiles = new();
+
 RefreshHeader();
+
+// Валидация конфига: проверяем, что для текущего провайдера есть API ключ.
+if (string.IsNullOrWhiteSpace(api.GetEffectiveKey()))
+{
+    var keyHint = config.ActiveConnection?.Name ?? "default";
+    screen.Write("❌ Нет API ключа для провайдера " + keyHint, ConsoleColor.Red, EntryStyle.Error);
+    screen.Write("Установите ключ через: /connect key " + keyHint + " <ваш-ключ>", ConsoleColor.Yellow);
+    screen.Write("Или через переменную окружения: IH_API_KEY=<ключ>", ConsoleColor.Yellow);
+    screen.Write("");
+}
+
 screen.Write("IntellectHub Console — type a message, press F1 for help, or Ctrl+K for commands.", ConsoleColor.DarkGray);
 screen.Write("");
 await CheckHealthAsync();
@@ -239,6 +259,9 @@ async Task RunTurnAsync(CancellationToken ct)
     try
     {
         await RunTurnCoreAsync(ct);
+        // Автоматический переход к следующему режиму, если текущий этап завершён
+        // (архитектура+план готовы → код; ошибка в коде → отладка; после отладки → код).
+        _modes?.AdvanceIfReady();
     }
     finally
     {
@@ -252,8 +275,17 @@ async Task RunTurnCoreAsync(CancellationToken ct)
     var turnId = Wire.NewTraceId();
 
     Wire.TraceId = null;
-    Wire.Write("turn", "start · history={0} msgs · tools={1} · planner={2}",
-        history.Count, tools.Specs.Count, _planner is not null ? "active" : "none");
+    Wire.Write("turn", "start · history={0} msgs · tools={1} · planner={2} · mode={3}",
+        history.Count, tools.Specs.Count, _planner is not null ? "active" : "none",
+        _modes is null ? "-" : _modes.CurrentDisplay);
+
+    // Активный режим проекта выбирается один раз на ход и сохраняется в .IntellectHub.
+    // Он добавляет модель контекст: архитектуру, план и лог отладки из .IntellectHub.
+    if (_modes is not null)
+    {
+        var lastUser = history.LastOrDefault(m => m.Role == "user")?.Content?.ToString() ?? "";
+        _modes.StartTurn(lastUser);
+    }
 
     for (var step = 0; step < 16; step++)
     {
@@ -286,15 +318,46 @@ async Task RunTurnCoreAsync(CancellationToken ct)
             history.Add(subtaskPrompt);
             // Self-check: сбрасываем флаг использования инструментов для новой подзадачи.
             _hasUsedWriteTools = false;
+            _writtenFiles.Clear();
             Wire.Write("planner.subtask", "executing subtask {0}/{1}: {2}", subtask.Index + 1, _planner.Total, subtask.Title);
         }
 
-        AssistantReply reply;
+        AssistantReply reply = null!;
         var callClock = System.Diagnostics.Stopwatch.StartNew();
+
         try
         {
-            reply = await api.SendAsync(history, tools.Specs, traceId, sessionKey, ct);
-            Sound.Notify();
+            // Временные ошибки провайдера (HTTP 503, 429, 502, 504) повторяем с
+            // экспоненциальной задержкой: 2 с, 4 с, 8 с.
+            const int maxRetries = 3;
+            Exception? lastTransient = null;
+            for (var attempt = 1; attempt <= maxRetries; attempt++)
+            {
+                try
+                {
+                    reply = await api.SendAsync(_modes?.WithContext(history) ?? history, tools.Specs, traceId, sessionKey, ct);
+                    Sound.Notify();
+                    lastTransient = null;
+                    break;
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex) when (IsTransientApiError(ex))
+                {
+                    lastTransient = ex;
+                    if (attempt < maxRetries)
+                    {
+                        var delayMs = (int)Math.Pow(2, attempt) * 1000;
+                        Wire.Write("turn", "api transient error (attempt {0}/{1}) · retrying in {2}ms", attempt, maxRetries, delayMs);
+                        await Task.Delay(delayMs, ct);
+                    }
+                }
+            }
+
+            if (lastTransient is not null)
+                throw lastTransient;
         }
         catch (OperationCanceledException)
         {
@@ -305,7 +368,36 @@ async Task RunTurnCoreAsync(CancellationToken ct)
             Console.Beep(1047, 60);
             Console.Beep(1318, 80);
             Wire.Write("step.err", "{0}: {1}", ex.GetType().Name, ex.Message);
-            throw;
+
+            // Ошибка сервера/сети (например, "The requested operation requires an element").
+            // Записываем в состояние модов и останавливаем ход, не кидая исключение наверх.
+            // Модель получит сообщение об ошибке в следующем ходе и сможет повторить запрос.
+            _modes?.NoteError("api", ex.Message);
+
+            // Провайдер снял модель с выдачи или её имя сменилось: вместо сырого JSON
+            // предлагаем выбрать существующую модель из живого списка, отмечая
+            // замену, которую назвал сам провайдер.
+            if (ex is ModelUnavailableException unavailable)
+            {
+                screen.Write($"модель {unavailable.Model} недоступна — провайдер снял её с выдачи или переименовал",
+                    ConsoleColor.Yellow, EntryStyle.Error);
+                if (unavailable.Suggestion is not null)
+                    screen.Write($"провайдер предлагает {unavailable.Suggestion} — она отмечена в списке",
+                        ConsoleColor.DarkGray);
+                screen.Write("выберите существующую модель:", ConsoleColor.DarkGray);
+                await ShowModelsAsync(unavailable.Suggestion);
+                screen.Write("после выбора повторите запрос: ↑ и Enter", ConsoleColor.DarkGray);
+            }
+            else
+            {
+                screen.Write($"ошибка сервера: {ex.Message}", ConsoleColor.Red, EntryStyle.Error);
+            }
+            screen.Write("");
+
+            Wire.TraceId = turnId;
+            Wire.Write("turn", "api error · {0} · {1} ms", ex.GetType().Name, callClock.ElapsedMilliseconds);
+            Wire.Timing("turn.end", turnClock, "finished");
+            return;
         }
 
         Wire.Timing("step", callClock, "round trip finished · stop_reason={0}", reply.StopReason);
@@ -346,13 +438,24 @@ async Task RunTurnCoreAsync(CancellationToken ct)
                 screen.Write("План принят. Подзадач: " + _planner.Total, ConsoleColor.Yellow);
                 screen.Write(_planner.PlanSummary(), ConsoleColor.DarkGray);
 
+                // Сохраняем план в .IntellectHub/plan.md, чтобы он пережил перезапуск
+                // и клиент знал, что архитектурный этап пройден.
+                var planBuilder = new System.Text.StringBuilder();
+                planBuilder.AppendLine("# План реализации");
+                planBuilder.AppendLine();
+                planBuilder.AppendLine("Автоматически разбит на подзадачи клиентом.");
+                planBuilder.AppendLine();
+                foreach (var s in _planner.Subtasks)
+                    planBuilder.AppendLine($"- [{s.Status}] {s.Index + 1}. {s.Title} — {s.Description}");
+                _modeStore!.SavePlan(planBuilder.ToString(), _modes!.State);
+
                 var assistantContent = new JsonArray();
                 if (reply.Text.Trim().Length > 0)
                     assistantContent.Add(new JsonObject { ["type"] = "text", ["text"] = reply.Text });
                 history.Add(new ChatMessage { Role = "assistant", Content = assistantContent });
 
                 Wire.TraceId = turnId;
-                Wire.Write("turn", "plan loaded · {0} subtasks · continuing with subtask execution", _planner.Total);
+                Wire.Write("turn", "plan loaded · {0} subtasks · saved to .IntellectHub/plan.md · continuing with subtask execution", _planner.Total);
                 continue; // next loop iteration will pick up the first subtask
             }
         }
@@ -456,17 +559,63 @@ async Task RunTurnCoreAsync(CancellationToken ct)
                     }
                     else
                     {
-                        _planner.MarkCurrentDone(reply.Text.Trim());
-                        screen.Write($"Подзадача {currentSubtask.Index + 1} готова.", ConsoleColor.Green);
+                        // Верифицируем, что файлы, которые модель собиралась записать, реально существуют.
+                        if (!VerifyWrittenFiles())
+                        {
+                            currentSubtask.Attempts++;
+                            const int maxAttempts = 3;
+                            if (currentSubtask.Attempts >= maxAttempts)
+                            {
+                                screen.Write($"Подзадача {currentSubtask.Index + 1} не выполнена после {maxAttempts} попыток (файлы не созданы) — пропускаем.", ConsoleColor.Red);
+                                _planner.MarkCurrentFailed("Written files do not exist after multiple attempts.");
+                                Wire.TraceId = turnId;
+                                Wire.Write("turn", "subtask {0} failed (files missing) · skipping", currentSubtask.Index + 1);
+                                var failContent = new JsonArray();
+                                failContent.Add(new JsonObject { ["type"] = "text", ["text"] = $"[Подзадача {currentSubtask.Index + 1} не выполнена — файлы не созданы]" });
+                                history.Add(new ChatMessage { Role = "assistant", Content = failContent });
+                            }
+                            else
+                            {
+                                screen.Write($"Подзадача {currentSubtask.Index + 1}: файлы не найдены на диске, повторяем (попытка {currentSubtask.Attempts}/{maxAttempts}).", ConsoleColor.Yellow);
+                                var retryPrompt = new ChatMessage
+                                {
+                                    Role = "user",
+                                    Content = JsonValue.Create(
+                                        $"Ты должен записать файлы для подзадачи {currentSubtask.Index + 1} из {_planner.Total}: \"{currentSubtask.Title}\".\n\n" +
+                                        $"Описание: {currentSubtask.Description}\n\n" +
+                                        $"ИСПОЛЬЗУЙ ИНСТРУМЕНТЫ write/edit, чтобы создать файлы на диске. " +
+                                        $"Перед завершением убедись, что файлы реально существуют. " +
+                                        $"НЕ ВЫВОДИ ТЕКСТ В ОТВЕТЕ — используй инструменты.")
+                                };
+                                history.Add(retryPrompt);
+                                Wire.TraceId = turnId;
+                                Wire.Write("turn", "subtask {0} files missing · retrying (attempt {1}/{2})", currentSubtask.Index + 1, currentSubtask.Attempts, maxAttempts);
+                                continue;
+                            }
+                        }
+                        else
+                        {
+                            _planner.MarkCurrentDone(reply.Text.Trim());
+                            screen.Write($"Подзадача {currentSubtask.Index + 1} готова.", ConsoleColor.Green);
 
-                        var assistantContent = new JsonArray();
-                        if (reply.Text.Trim().Length > 0)
-                            assistantContent.Add(new JsonObject { ["type"] = "text", ["text"] = reply.Text });
-                        history.Add(new ChatMessage { Role = "assistant", Content = assistantContent });
+                            var assistantContent = new JsonArray();
+                            if (reply.Text.Trim().Length > 0)
+                                assistantContent.Add(new JsonObject { ["type"] = "text", ["text"] = reply.Text });
+                            history.Add(new ChatMessage { Role = "assistant", Content = assistantContent });
+                        }
                     }
                 }
 
-                if (_planner.HasNext)
+                // Если модель использовала write/edit в текущей подзадаче — считаем её выполненной.
+                if (_planner is not null && config.SelfCheck && HasUsedWriteTools())
+                {
+                    if (!TryCompleteCurrentSubtask(reply.Text.Trim(), turnId, history))
+                    {
+                        continue; // retry: файлы не найдены, повторим запрос
+                    }
+                }
+
+                if (_planner is not null && _planner.HasNext)
                 {
                     Wire.TraceId = turnId;
                     Wire.Write("turn", "subtask done · continuing with subtask {0}/{1}",
@@ -474,14 +623,20 @@ async Task RunTurnCoreAsync(CancellationToken ct)
                     continue; // execute next subtask
                 }
 
-                screen.Write("Все подзадачи выполнены.", ConsoleColor.Green);
-                _planner = null;
+                if (_planner is not null && !_planner.HasNext)
+                {
+                    screen.Write("Все подзадачи выполнены.", ConsoleColor.Green);
+                    _planner = null;
 
-                // Back to the turn id: the step loop overwrote it.
-                Wire.TraceId = turnId;
-                Wire.Write("turn", "done · all subtasks complete · {0} steps · {1} msgs in history", step + 1, history.Count);
-                Wire.Timing("turn.end", turnClock, "finished");
-                return;
+                    // Переходим к следующему режиму по порядку (Architect → Code → Debug → Code …).
+                    _modes?.AdvanceToNextMode();
+
+                    // Back to the turn id: the step loop overwrote it.
+                    Wire.TraceId = turnId;
+                    Wire.Write("turn", "done · all subtasks complete · {0} steps · {1} msgs in history", step + 1, history.Count);
+                    Wire.Timing("turn.end", turnClock, "finished");
+                    return;
+                }
             }
 
             if (reply.Text.Trim().Length > 0)
@@ -515,27 +670,66 @@ async Task RunTurnCoreAsync(CancellationToken ct)
         if (_planner is not null && config.SelfCheck && HasUsedWriteTools())
         {
             var currentSubtask = _planner.Current!;
-            // Простейшая верификация: файл был изменен после начала подзадачи
-            // (в идеале здесь должна быть проверка на корректность результата, например, компиляция)
-            _planner.MarkCurrentDone(reply.Text.Trim());
-            screen.Write($"Подзадача {currentSubtask.Index + 1} готова (инструменты использованы).", ConsoleColor.Green);
 
-            if (_planner.HasNext)
+            // Верифицируем, что файлы, которые модель собралась записать, реально существуют на диске.
+            if (!VerifyWrittenFiles())
             {
-                Wire.TraceId = turnId;
-                Wire.Write("turn", "subtask done (tools used) · continuing with subtask {0}/{1}",
-                    _planner.Current!.Index + 1, _planner.Total);
-                continue; // execute next subtask
+                currentSubtask.Attempts++;
+                const int maxAttempts = 3;
+                if (currentSubtask.Attempts >= maxAttempts)
+                {
+                    screen.Write($"Подзадача {currentSubtask.Index + 1} не выполнена после {maxAttempts} попыток (файлы не созданы) — пропускаем.", ConsoleColor.Red);
+                    _planner.MarkCurrentFailed("Written files do not exist after multiple attempts.");
+                    Wire.TraceId = turnId;
+                    Wire.Write("turn", "subtask {0} failed (files missing) · skipping", currentSubtask.Index + 1);
+                    var failContent = new JsonArray();
+                    failContent.Add(new JsonObject { ["type"] = "text", ["text"] = $"[Подзадача {currentSubtask.Index + 1} не выполнена — файлы не созданы]" });
+                    history.Add(new ChatMessage { Role = "assistant", Content = failContent });
+                }
+                else
+                {
+                    screen.Write($"Подзадача {currentSubtask.Index + 1}: файлы не найдены на диске, повторяем (попытка {currentSubtask.Attempts}/{maxAttempts}).", ConsoleColor.Yellow);
+                    var retryPrompt = new ChatMessage
+                    {
+                        Role = "user",
+                        Content = JsonValue.Create(
+                            $"Ты должен записать файлы для подзадачи {currentSubtask.Index + 1} из {_planner.Total}: \"{currentSubtask.Title}\".\n\n" +
+                            $"Описание: {currentSubtask.Description}\n\n" +
+                            $"ИСПОЛЬЗУЙ ИНСТРУМЕНТЫ write/edit, чтобы создать файлы на диске. " +
+                            $"Перед завершением убедись, что файлы реально существуют. " +
+                            $"НЕ ВЫВОДИ ТЕКСТ В ОТВЕТЕ — используй инструменты.")
+                    };
+                    history.Add(retryPrompt);
+                    Wire.TraceId = turnId;
+                    Wire.Write("turn", "subtask {0} files missing · retrying (attempt {1}/{2})", currentSubtask.Index + 1, currentSubtask.Attempts, maxAttempts);
+                    continue;
+                }
             }
+            else
+            {
+                _planner.MarkCurrentDone(reply.Text.Trim());
+                screen.Write($"Подзадача {currentSubtask.Index + 1} готова (инструменты использованы, файлы проверены).", ConsoleColor.Green);
 
-            screen.Write("Все подзадачи выполнены.", ConsoleColor.Green);
-            _planner = null;
+                if (_planner.HasNext)
+                {
+                    Wire.TraceId = turnId;
+                    Wire.Write("turn", "subtask done (tools used) · continuing with subtask {0}/{1}",
+                        _planner.Current!.Index + 1, _planner.Total);
+                    continue; // execute next subtask
+                }
 
-            // Back to the turn id: the step loop overwrote it.
-            Wire.TraceId = turnId;
-            Wire.Write("turn", "done · all subtasks complete · {0} steps · {1} msgs in history", step + 1, history.Count);
-            Wire.Timing("turn.end", turnClock, "finished");
-            return;
+                screen.Write("Все подзадачи выполнены.", ConsoleColor.Green);
+                _planner = null;
+
+                // Переходим к следующему режиму по порядку (Architect → Code → Debug → Code …).
+                _modes?.AdvanceToNextMode();
+
+                // Back to the turn id: the step loop overwrote it.
+                Wire.TraceId = turnId;
+                Wire.Write("turn", "done · all subtasks complete · {0} steps · {1} msgs in history", step + 1, history.Count);
+                Wire.Timing("turn.end", turnClock, "finished");
+                return;
+            }
         }
 
         var results = new JsonArray();
@@ -631,10 +825,29 @@ async Task RunTurnCoreAsync(CancellationToken ct)
                 if (call.Name is "write" or "edit" or "question")
                 {
                     _hasUsedWriteTools = true;
+                    var path = ReadArg(call.Arguments, "path");
+                    if (path.Length > 0 && !_writtenFiles.Contains(path))
+                        _writtenFiles.Add(path);
+
+                    // Записываем артефакт мода в .IntellectHub и обновляем флаги готовности.
+                    var content = ReadArg(call.Arguments, "content");
+                    if (call.Name == "write")
+                    {
+                        _modes?.RecordArtifact(_modes.Effective, path, content);
+                    }
+                    else if (call.Name == "edit")
+                    {
+                        // Для edit читаем текущее содержимое файла, чтобы передать в RecordArtifact.
+                        var existing = _modeStore is not null && _modeStore.TryReadArtifact(path, out var current)
+                            ? current
+                            : "";
+                        _modes?.RecordArtifact(_modes.Effective, path, existing);
+                    }
                 }
 
                 var toolClock = System.Diagnostics.Stopwatch.StartNew();
                 var result = await tools.ExecuteAsync(call);
+                if (result.IsError) _modes?.NoteError(call.Name, result.Output);
                 ct.ThrowIfCancellationRequested();
                 if (result.IsError) Sound.Error(); else Sound.Success();
                 Wire.Timing("tool.done", toolClock, "{0} · is_error={1} · {2} chars of output",
@@ -646,13 +859,27 @@ async Task RunTurnCoreAsync(CancellationToken ct)
                 screen.Write((result.IsError ? "error · " : "ok · ") + Fold(result.Output),
                     result.IsError ? ConsoleColor.Red : ConsoleColor.DarkGray, EntryStyle.ToolOutput);
 
+                // Если инструмент вернул ошибку — говорим модели чётко: исправь аргументы и повтори.
+                // Иначе модель может просто сдаться (как было с glob { pattern }).
+                var toolContent = result.IsError
+                    ? $"Ошибка выполнения инструмента '{call.Name}': {result.Output}\n\nИсправь аргументы и вызови этот же инструмент повторно с правильными параметрами. Не пропускай этот шаг."
+                    : result.Output;
+
                 results.Add(new JsonObject
                 {
                     ["type"] = "tool_result",
                     ["tool_use_id"] = call.Id,
-                    ["content"] = result.Output,
+                    ["content"] = toolContent,
                     ["is_error"] = result.IsError,
                 });
+
+                // При ошибке инструмента — ОСТАНАВЛИВАЕМ ход, не продолжаем нестись дальше.
+                // Модель получит ошибку в следующем ходе и должна её исправить.
+                if (result.IsError)
+                {
+                    stop = true;
+                    break;
+                }
 
                 if (choice == BarrierChoice.Step) stop = true;
                 break;
@@ -662,6 +889,30 @@ async Task RunTurnCoreAsync(CancellationToken ct)
         }
 
         history.Add(new ChatMessage { Role = "user", Content = results });
+
+        // Если модель использовала write/edit для текущей подзадача — завершаем её.
+        if (_planner is not null && config.SelfCheck && HasUsedWriteTools())
+        {
+            if (!TryCompleteCurrentSubtask("", turnId, history))
+            {
+                continue; // повторить запрос: файлы не найдены
+            }
+
+            // Все подзадачи выполнены — сбрасываем планировщик и переходим к следующему режиму.
+            if (_planner is not null && !_planner.HasNext)
+            {
+                screen.Write("Все подзадачи выполнены.", ConsoleColor.Green);
+                _planner = null;
+
+                // Переходим к следующему режиму по порядку (Architect → Code → Debug → Code …).
+                _modes?.AdvanceToNextMode();
+
+                Wire.TraceId = turnId;
+                Wire.Write("turn", "done · all subtasks complete (tools path) · {0} steps · {1} msgs in history", step + 1, history.Count);
+                Wire.Timing("turn.end", turnClock, "finished");
+                return;
+            }
+        }
 
         if (stop)
         {
@@ -678,6 +929,17 @@ async Task RunTurnCoreAsync(CancellationToken ct)
     Wire.Write("turn", "hit the 16-step cap without a final answer");
     Wire.Timing("turn.end", turnClock, "finished");
 }
+
+    /// <summary>Определяет, является ли ошибка API временной (что имеет смысл повторять).</summary>
+    static bool IsTransientApiError(Exception ex)
+    {
+        if (ex is HttpRequestException hre)
+        {
+            var msg = ex.Message;
+            return msg.Contains("503") || msg.Contains("429") || msg.Contains("502") || msg.Contains("504");
+        }
+        return false;
+    }
 
 static string Describe(ToolCall call)
 {
@@ -725,6 +987,8 @@ static string PrimaryArg(string tool) => tool switch
     "check" => "path",
     _ => "input",
 };
+
+
 
 static string ReadArg(string arguments, string name)
 {
@@ -804,6 +1068,20 @@ async Task RevealAsync(string text)
 
 async Task CheckHealthAsync()
 {
+    var isLocal = config.BaseUrl.StartsWith("http://127.0.0.1") ||
+                  config.BaseUrl.StartsWith("http://localhost");
+
+    if (!isLocal)
+    {
+        // External providers (Google, Anthropic, OpenAI, etc.) don't have a /health
+        // endpoint. Just confirm the address is configured.
+        screen.Write("connected to " + config.BaseUrl, ConsoleColor.DarkGray);
+        Wire.TraceId = null;
+        Wire.Write("health", "external provider at {0}", config.BaseUrl);
+        screen.Write("");
+        return;
+    }
+
     try
     {
         await api.HealthAsync();
@@ -813,9 +1091,6 @@ async Task CheckHealthAsync()
     }
     catch (HttpRequestException ex)
     {
-        // "No connection could be made" on its own leaves the user with nothing to
-        // act on. Name the address, say what it means, and give the command that
-        // fixes it.
         screen.Write("cannot reach " + config.BaseUrl, ConsoleColor.Red);
         screen.Write("  the server is not listening there", ConsoleColor.DarkGray);
         screen.Write("  start IntellectHub, or point elsewhere: /connect <url>", ConsoleColor.DarkGray);
@@ -831,7 +1106,7 @@ async Task CheckHealthAsync()
     screen.Write("");
 }
 
-async Task ShowModelsAsync()
+async Task ShowModelsAsync(string? recommended = null)
 {
     IReadOnlyList<string> models;
     try
@@ -858,22 +1133,39 @@ async Task ShowModelsAsync()
 
     var current = models.ToList().FindIndex(m => string.Equals(m, config.Model, StringComparison.OrdinalIgnoreCase));
     var items = models
-        .Select(m => new PickItem(m, null, string.Equals(m, config.Model, StringComparison.OrdinalIgnoreCase) ? "current" : null))
+        .Select(m =>
+        {
+            string? badge = null;
+            if (recommended is not null && string.Equals(ModelName.Short(m), recommended, StringComparison.OrdinalIgnoreCase))
+                badge = "recommended";
+            else if (string.Equals(m, config.Model, StringComparison.OrdinalIgnoreCase))
+                badge = "current";
+            return new PickItem(m, null, badge);
+        })
         .ToList();
 
-    var picked = screen.Pick("models", items, "↑↓ move · ⏎ use model · Esc close", Math.Max(0, current));
+    var initial = recommended is null
+        ? Math.Max(0, current)
+        : Math.Max(0, items.FindIndex(i => i.Badge == "recommended"));
+    var picked = screen.Pick("models", items, "↑↓ move · ⏎ use model · Esc close", initial);
     if (picked is null) return;
 
-    var model = models[picked.Value];
+    var model = ModelName.Short(models[picked.Value]);
     if (string.Equals(model, config.Model, StringComparison.OrdinalIgnoreCase))
     {
         screen.Write($"model is already {model}", ConsoleColor.DarkGray);
         return;
     }
 
+    // Для именованного подключения эффективная модель берётся из записи
+    // подключения, а не из верхнего config.Model, поэтому обновляем обе: иначе
+    // выбор молча не применяется к последующим запросам.
     config.Model = model;
+    var savedConnection = config.Connections.FirstOrDefault(c =>
+        string.Equals(c.Name, config.ConnectionName, StringComparison.OrdinalIgnoreCase));
+    if (savedConnection is not null) savedConnection.Model = model;
     config.Save();
-    RefreshHeader();
+    Reconnect();
     Wire.TraceId = null;
     Wire.Write("model", "{0}", model);
     screen.Write($"model = {model}", ConsoleColor.Green, EntryStyle.Notice);
@@ -919,6 +1211,10 @@ async Task<bool> RunCommandAsync(ParsedInput parsed)
 
         case "/project":
             await SelectProjectAsync(parsed.Arguments);
+            return true;
+
+        case "/mode":
+            ModeCommandAsync(parsed.Arguments);
             return true;
 
         default:
@@ -983,6 +1279,7 @@ void ReportUnknownCommand(ParsedInput parsed)
         if (picked is not null)
         {
             ApplyConnection(picked);
+            Reconnect();
             await CheckHealthAsync();
             return;
         }
@@ -1490,6 +1787,8 @@ async Task SwitchProjectAsync(string path)
         project = Project.Open(path);
         tools = new ToolRegistry(project.Root, config);
         log = new SessionLog(project.LogPath);
+        _modeStore = new ModeStore(project);
+        _modes = new ModeManager(project, _modeStore, screen);
         // A new workspace means a new conversation, so the remote chat behind this
         // one has to be released along with the transcript.
         history.Clear();
@@ -1715,6 +2014,78 @@ void Reconnect()
     RefreshHeader();
 }
 
+/// <summary>
+/// Переключение и просмотр режимов разработки: Architect → Code → Debug,
+/// координирует Orchestrator. Состояние хранится в .IntellectHub/mode.json.
+/// </summary>
+void ModeCommandAsync(string arguments)
+{
+    var (name, rest) = Split(arguments);
+
+    if (name.Length == 0 || name.Equals("status", StringComparison.OrdinalIgnoreCase))
+    {
+        ShowModeStatus();
+        return;
+    }
+
+    if (name.Equals("reset", StringComparison.OrdinalIgnoreCase))
+    {
+        _modes!.ResetForNewTask();
+        screen.Write("моды сброшены — следующая задача начнётся с архитектора (Architect Mode).",
+            ConsoleColor.Green, EntryStyle.Notice);
+        return;
+    }
+
+    if (name.Equals("next", StringComparison.OrdinalIgnoreCase))
+    {
+        _modes!.Complete(_modes.Effective);
+        screen.Write($"следующий режим: {_modes.EffectiveInfo.Title}",
+            ConsoleColor.Green, EntryStyle.Notice);
+        return;
+    }
+
+    try
+    {
+        var mode = Modes.Parse(name);
+        _modes!.SwitchTo(mode, "переключено пользователем");
+    }
+    catch (Exception ex)
+    {
+        screen.Write("error: " + ex.Message, ConsoleColor.Red, EntryStyle.Error);
+    }
+}
+
+void ShowModeStatus()
+{
+    if (_modes is null)
+    {
+        screen.Write("моды недоступны", ConsoleColor.Red);
+        return;
+    }
+
+    var s = _modes.State;
+    screen.Write("режимы разработки (.IntellectHub)", ConsoleColor.White);
+    screen.Write($"  текущий: {_modes.CurrentInfo.Title} ({_modes.CurrentDisplay}) — {_modes.CurrentInfo.Description}",
+        ConsoleColor.Cyan);
+    if (_modes.Effective != _modes.Current)
+        screen.Write($"  рабочий (под капотом): {_modes.EffectiveInfo.Title} ({_modes.EffectiveDisplay})",
+            ConsoleColor.DarkGray);
+    screen.Write($"  архитектура готова: {(s.ArchitectureReady ? "да" : "нет")}");
+    screen.Write($"  план готов: {(s.PlanReady ? "да" : "нет")}");
+    screen.Write($"  код готов: {(s.CodeReady ? "да" : "нет")}");
+    if (s.LastError is { } err) screen.Write($"  последняя ошибка: {err}", ConsoleColor.Red);
+    screen.Write($"  циклов отладки: {s.DebugCycles}");
+    screen.Write($"  последняя задача: {s.LastTask ?? "(нет)"}");
+    if (s.History.Count > 0)
+    {
+        screen.Write("  история переходов: " +
+            string.Join(" → ", s.History.Select(h => $"{h.From?.ToString() ?? "—"}→{h.To}")));
+    }
+    screen.Write("");
+    screen.Write("  /mode architect · /mode code · /mode debug · /mode orchestrator", ConsoleColor.DarkGray);
+    screen.Write("  /mode next · /mode reset · /mode status", ConsoleColor.DarkGray);
+}
+
 async Task PlanCurrentTaskAsync()
 {
     // Находим последнее сообщение пользователя в истории.
@@ -1825,6 +2196,90 @@ bool HasUsedWriteTools()
 {
     return _hasUsedWriteTools;
 }
+
+/// <summary>
+/// Проверяет, что все файлы, которые модель записала в текущей подзадаче,
+/// реально существуют на диске и не пустые. Если файлов нет — подзадача не считается выполненной.
+/// </summary>
+bool VerifyWrittenFiles()
+{
+    if (_writtenFiles.Count == 0) return true;
+
+    foreach (var relPath in _writtenFiles)
+    {
+        var fullPath = Path.GetFullPath(Path.Combine(project.Root, relPath));
+        if (!File.Exists(fullPath))
+        {
+            Wire.Write("verify.files", "missing file: {0}", fullPath);
+            return false;
+        }
+        try
+        {
+            if (new FileInfo(fullPath).Length == 0)
+            {
+                Wire.Write("verify.files", "empty file: {0}", fullPath);
+                return false;
+            }
+        }
+        catch
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+    /// <summary>
+    /// Проверяет, что модель использовала write/edit для текущей подзадачи,
+    /// верифицирует, что файлы реально существуют на диске, и помечает
+    /// подзадачу как выполненную. Возвращает false, если нужен repeat-запрос
+    /// (файлы не найдены и попытки не исчерпаны).
+    /// </summary>
+    bool TryCompleteCurrentSubtask(string assistantText, string traceId, List<ChatMessage> history)
+    {
+        var currentSubtask = _planner!.Current!;
+
+        if (!VerifyWrittenFiles())
+        {
+            currentSubtask.Attempts++;
+            const int maxAttempts = 3;
+            if (currentSubtask.Attempts >= maxAttempts)
+            {
+                screen.Write($"Подзадача {currentSubtask.Index + 1} не выполнена после {maxAttempts} попыток (файлы не созданы) — пропускаем.", ConsoleColor.Red);
+                _planner.MarkCurrentFailed("Written files do not exist after multiple attempts.");
+                Wire.TraceId = traceId;
+                Wire.Write("turn", "subtask {0} failed (files missing) · skipping", currentSubtask.Index + 1);
+                var failContent = new JsonArray();
+                failContent.Add(new JsonObject { ["type"] = "text", ["text"] = $"[Подзадача {currentSubtask.Index + 1} не выполнена — файлы не созданы]" });
+                history.Add(new ChatMessage { Role = "assistant", Content = failContent });
+                return true; // подзадача помечена как Failed — можно переходить к следующей
+            }
+            else
+            {
+                screen.Write($"Подзадача {currentSubtask.Index + 1}: файлы не найдены на диске, повторяем (попытка {currentSubtask.Attempts}/{maxAttempts}).", ConsoleColor.Yellow);
+                var retryPrompt = new ChatMessage
+                {
+                    Role = "user",
+                    Content = JsonValue.Create(
+                        $"Ты должен записать файлы для подзадачи {currentSubtask.Index + 1} из {_planner.Total}: \"{currentSubtask.Title}\".\n\n" +
+                        $"Описание: {currentSubtask.Description}\n\n" +
+                        $"ИСПОЛЬЗУЙ ИНСТРУМЕНТЫ write/edit, чтобы создать файлы на диске. " +
+                        $"Перед завершением убедись, что файлы реально существуют. " +
+                        $"НЕ ВЫВОДИ ТЕКСТ В ОТВЕТЕ — используй инструменты.")
+                };
+                history.Add(retryPrompt);
+                Wire.TraceId = traceId;
+                Wire.Write("turn", "subtask {0} files missing · retrying (attempt {1}/{2})", currentSubtask.Index + 1, currentSubtask.Attempts, maxAttempts);
+                return false; // нужен repeat
+            }
+        }
+        else
+        {
+            _planner.MarkCurrentDone(assistantText);
+            screen.Write($"Подзадача {currentSubtask.Index + 1} готова (инструменты использованы, файлы проверены).", ConsoleColor.Green);
+            return true;
+        }
+    }
 
 static class Sound
 {

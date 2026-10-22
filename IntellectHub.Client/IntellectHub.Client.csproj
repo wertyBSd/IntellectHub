@@ -20,6 +20,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\IntellectHub.Core\IntellectHub.Core.csproj" />
     <InternalsVisibleTo Include="IntellectHub.Tests" />
   </ItemGroup>
 

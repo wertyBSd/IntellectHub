@@ -4,6 +4,22 @@ using System.Text.Json.Serialization;
 namespace IntellectHub.Client;
 
 /// <summary>
+/// Извлекает короткое имя модели из полного пути Google API.
+/// Google API возвращает имена в формате:
+/// projects/.../locations/.../publishers/google/models/gemini-2.0-flash
+/// Нам нужно только последнюю часть: gemini-2.0-flash
+/// </summary>
+public static class ModelName
+{
+    public static string Short(string model)
+    {
+        if (string.IsNullOrWhiteSpace(model)) return model;
+        var lastSlash = model.LastIndexOf('/');
+        return lastSlash >= 0 ? model[(lastSlash + 1)..] : model;
+    }
+}
+
+/// <summary>
 /// Wire protocol used to talk to a model provider.
 /// </summary>
 public enum ProviderKind
@@ -138,7 +154,7 @@ public sealed class ClientConfig
             Name = "google",
             Provider = ProviderKind.OpenAI,
             Url = "https://generativelanguage.googleapis.com/v1beta/openai",
-            Model = "gemini-2.0-flash",
+            Model = "gemini-3.8-flash",
             Auth = AuthStyle.GoogleApiKey,
             SecretKey = "apiKey:google",
         };
@@ -433,6 +449,35 @@ public sealed class ClientConfig
         var seeded = new HashSet<string>(config.Connections.Select(c => c.Name), StringComparer.OrdinalIgnoreCase);
         foreach (var preset in Providers.Presets)
             if (!seeded.Contains(preset.Name)) config.Connections.Add(preset.Copy());
+
+        // Seeding freezes the preset values of the version that first wrote them:
+        // a client.json written before the preset changed carries the retired name
+        // forever, and nobody typed "gemini-2.0-flash" by hand — the seeder did.
+        // Google retired that model in favor of the 3.8 series, so an entry still
+        // on it follows the current preset default again.
+        const string retiredModel = "gemini-2.0-flash";
+        foreach (var saved in config.Connections)
+        {
+            var preset = Providers.Find(saved.Name);
+            if (preset is null) continue;
+            if (string.Equals(saved.Model, retiredModel, StringComparison.OrdinalIgnoreCase))
+                saved.Model = preset.Model;
+        }
+        if (string.Equals(config.Model, retiredModel, StringComparison.OrdinalIgnoreCase))
+        {
+            var activePreset = Providers.Find(config.ConnectionName);
+            if (activePreset is not null) config.Model = activePreset.Model;
+        }
+
+        // Тот же заморозка попала и в системный промпт: старый дефолт — одно
+        // предложение без протокола — вытеснил текущий, который инструктирует
+        // модель писать файлы через инструменты и разбивать большие задачи на
+        // подзадачи. Файл с устаревшим дефолтом дословно находим и обновляем;
+        // собственную правку пользователя не трогаем.
+        const string retiredSystem =
+            "You are IntellectHub, a concise and helpful assistant.";
+        if (string.Equals(config.System, retiredSystem, StringComparison.Ordinal))
+            config.System = new ClientConfig().System;
 
         var envUrl = Environment.GetEnvironmentVariable("IH_BASE_URL");
         if (!string.IsNullOrWhiteSpace(envUrl))

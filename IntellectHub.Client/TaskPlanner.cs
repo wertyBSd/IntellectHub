@@ -23,10 +23,19 @@ public sealed class TaskPlanner
         using var doc = JsonDocument.Parse(planJson);
         var root = doc.RootElement;
 
-        if (!root.TryGetProperty("subtasks", out var arr))
+        JsonElement arr;
+        if (root.ValueKind == JsonValueKind.Array)
         {
-            // Пытаемся считать как массив напрямую
-            arr = root.ValueKind == JsonValueKind.Array ? root : default;
+            // Модель вернула просто массив подзадач
+            arr = root;
+        }
+        else if (root.TryGetProperty("subtasks", out var subtasks))
+        {
+            arr = subtasks;
+        }
+        else
+        {
+            arr = default;
         }
 
         _subtasks.Clear();

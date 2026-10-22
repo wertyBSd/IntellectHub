@@ -1,5 +1,6 @@
 <Solution>
   <Project Path="IntellectHub/IntellectHub.csproj" />
+  <Project Path="IntellectHub.Core/IntellectHub.Core.csproj" />
   <Project Path="IntellectHub.Tests/IntellectHub.Tests.csproj" />
   <Project Path="IntellectHub.Client/IntellectHub.Client.csproj" />
 </Solution>

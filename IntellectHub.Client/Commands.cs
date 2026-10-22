@@ -80,6 +80,7 @@ internal static class CommandLine
         new("/project",  "/project [path]",    "switch workspace from recent folders", ["/cd"]),
         new("/clear",    "/clear",             "clear the conversation", ["/reset"]),
         new("/plan",     "/plan",              "break current task into subtasks", ["/decompose"]),
+        new("/mode",     "/mode [architect|code|debug|orchestrator|next|reset|status]", "переключить режим разработки и показать состояние модов", ["/m"]),
         new("/exit",     "/exit",              "leave", ["/quit", "/q"]),
     ];
 

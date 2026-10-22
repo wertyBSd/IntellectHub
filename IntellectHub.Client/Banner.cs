@@ -6,7 +6,7 @@ namespace IntellectHub.Client;
 
 public static class Banner
 {
-    public const string Version = "0.4.0";
+    public const string Version = "0.4.1";
 
     /// <summary>
     /// A compact, quiet header: identity on the left, where it is talking to on the
