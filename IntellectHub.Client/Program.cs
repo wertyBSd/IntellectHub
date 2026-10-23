@@ -96,6 +96,11 @@ RememberProject(project.Root);
 // клиент выполняет их по очереди, один за другим.
 TaskPlanner? _planner = null;
 
+// Индекс подзадачи, для которой уже добавлен prompt. Раньше prompt добавлялся
+// на каждом шаге цикла и обнулял _hasUsedWriteTools: модель писала файл, а
+// клиент «забывал» об этом и требовал тот же шаг снова.
+int _lastPromptedSubtask = -1;
+
 // Self-check: отслеживаем использование инструментов write/edit для проверки выполнения подзадач.
 bool _hasUsedWriteTools = false;
 
@@ -279,6 +284,22 @@ async Task RunTurnCoreAsync(CancellationToken ct)
     var turnClock = System.Diagnostics.Stopwatch.StartNew();
     var turnId = Wire.NewTraceId();
 
+    // Сколько раз за ход мы уже просили модель перейти от текста к инструментам.
+    var modeNudges = 0;
+
+    // Retry counter for when forceToolUse is ignored by the model.
+    int _forceRetryCount = 0;
+    bool hasForceRetried = false;
+
+    // Новый ход: разрешаем один раз подставить prompt текущей подзадачи.
+    // Для задачи без планировщика сбрасываем и tracking записи файлов.
+    _lastPromptedSubtask = -1;
+    if (_planner is null)
+    {
+        _hasUsedWriteTools = false;
+        _writtenFiles.Clear();
+    }
+
     Wire.TraceId = null;
     Wire.Write("turn", "start · history={0} msgs · tools={1} · planner={2} · mode={3}",
         history.Count, tools.Specs.Count, _planner is not null ? "active" : "none",
@@ -308,27 +329,43 @@ async Task RunTurnCoreAsync(CancellationToken ct)
         if (_planner is not null && _planner.HasNext)
         {
             var subtask = _planner.Current!;
-            var subtaskPrompt = new ChatMessage
+            if (_lastPromptedSubtask != subtask.Index)
             {
-                Role = "user",
-                Content = JsonValue.Create(
-                    $"Выполни подзадачу {subtask.Index + 1} из {_planner.Total}: {subtask.Title}\n\n" +
-                    $"Описание: {subtask.Description}\n\n" +
-                    $"ИСПОЛЬЗУЙ ИНСТРУМЕНТЫ write/edit, чтобы записать свою часть результата в соответствующие файлы проекта. " +
-                    $"НЕ ВЫВОДИ ТЕКСТ В ОТВЕТЕ — используй инструменты для записи в файл. " +
-                    $"НЕ ПИШИ СКРИПТЫ В ОТВЕТЕ — используй инструмент bash для выполнения команд. " +
-                    $"Не пытайся сделать всё за один вызов — пиши только эту часть. " +
-                    $"Когда закончишь, напиши краткий отчёт текстом без вызовов инструментов.")
-            };
-            history.Add(subtaskPrompt);
-            // Self-check: сбрасываем флаг использования инструментов для новой подзадачи.
-            _hasUsedWriteTools = false;
-            _writtenFiles.Clear();
-            Wire.Write("planner.subtask", "executing subtask {0}/{1}: {2}", subtask.Index + 1, _planner.Total, subtask.Title);
+                var subtaskPrompt = new ChatMessage
+                {
+                    Role = "user",
+                    Content = JsonValue.Create(
+                        $"ПЕРВЫМ ДЕЛОМ просмотри существующие файлы проекта на диске (index.html, script.js, styles.css и т.д.) " +
+                        $"— посмотри, что уже готово, что сломано, чего не хватает. " +
+                        $"НЕ пиши рабочие файлы в .IntellectHub/ — пиши в корень проекта. " +
+                        $"Не дублируй уже существующий код.\n\n" +
+                        $"Выполни подзадачу {subtask.Index + 1} из {_planner.Total}: {subtask.Title}\n\n" +
+                        $"Описание: {subtask.Description}\n\n" +
+                        $"ИСПОЛЬЗУЙ ИНСТРУМЕНТЫ write/edit, чтобы записать свою часть результата в соответствующие файлы проекта. " +
+                        $"НЕ ВЫВОДИ ТЕКСТ В ОТВЕТЕ — используй инструменты для записи в файл. " +
+                        $"НЕ ПИШИ СКРИПТЫ В ОТВЕТЕ — используй инструмент bash для выполнения команд. " +
+                        $"Не пытайся сделать всё за один вызов — пиши только эту часть. " +
+                        $"Когда закончишь, напиши краткий отчёт текстом без вызовов инструментов.")
+                };
+                history.Add(subtaskPrompt);
+                // Self-check: сбрасываем флаг использования инструментов только
+                // при переходе к новой подзадаче, а не на каждом шаге.
+                _hasUsedWriteTools = false;
+                _writtenFiles.Clear();
+                _lastPromptedSubtask = subtask.Index;
+                Wire.Write("planner.subtask", "executing subtask {0}/{1}: {2}", subtask.Index + 1, _planner.Total, subtask.Title);
+            }
         }
 
         AssistantReply reply = null!;
         var callClock = System.Diagnostics.Stopwatch.StartNew();
+
+        // Пока модель не записала ни одного файла в текущем шаге/подзадаче,
+        // требуем именно tool call. Это отсекает многоминутные текстовые
+        // «архитектуры» и заставляет qwen сразу вызвать write.
+        var forceToolUse = !_hasUsedWriteTools &&
+            (_planner is not null ||
+             (_modes is not null && _modes.Effective is Mode.Architect or Mode.Code or Mode.Debug));
 
         try
         {
@@ -340,7 +377,7 @@ async Task RunTurnCoreAsync(CancellationToken ct)
             {
                 try
                 {
-                    reply = await api.SendAsync(_modes?.WithContext(history) ?? history, tools.Specs, traceId, sessionKey, ModelRole.Default, ct);
+                    reply = await api.SendAsync(_modes?.WithContext(history) ?? history, tools.Specs, traceId, sessionKey, ModelRole.Default, ct, forceToolUse);
                     Sound.Notify();
                     lastTransient = null;
                     break;
@@ -407,12 +444,15 @@ async Task RunTurnCoreAsync(CancellationToken ct)
 
         Wire.Timing("step", callClock, "round trip finished · stop_reason={0}", reply.StopReason);
 
-        if (reply.Text.Trim().Length > 0)
-            log.Thought(reply.Text.Trim());
-
         // Если все вызовы инструментов — placeholder-имена (noop, no_tool_available и т.д.),
         // трактуем это как отсутствие реальных вызовов: модель отказалась от инструментов.
         var allPlaceholder = reply.ToolCalls.All(c => IsPlaceholderToolName(c.Name));
+
+        // Don't log/display the model's text response when it has actual tool calls.
+        // The model often outputs the tool call as JSON in its text response (explaining what it's doing),
+        // which clutters the console. The tool calls themselves are the action.
+        if (reply.Text.Trim().Length > 0 && !reply.HasToolCalls)
+            log.Thought(reply.Text.Trim());
 
         // Если модель прислала JSON-план со списком подзадач — загружаем его в
         // планировщик и начинаем выполнение с первой.
@@ -440,6 +480,7 @@ async Task RunTurnCoreAsync(CancellationToken ct)
             if (maybePlan is not null)
             {
                 _planner = maybePlan;
+                _lastPromptedSubtask = -1;
                 screen.Write("План принят. Подзадач: " + _planner.Total, ConsoleColor.Yellow);
                 screen.Write(_planner.PlanSummary(), ConsoleColor.DarkGray);
 
@@ -467,6 +508,50 @@ async Task RunTurnCoreAsync(CancellationToken ct)
 
         if (!reply.HasToolCalls || allPlaceholder)
         {
+            // Auto-режим должен доводить задачу до кода, а не останавливаться на
+            // текстовом ответе. Небольшие локальные модели (например,
+            // qwen2.5-coder:7b) часто отвечают архитектурой/планом простым текстом
+            // вместо вызова write или просто пишут «готово» после записи файлов.
+            if (_planner is null && _modes is not null && _modes.Current == Mode.Auto)
+            {
+                if (TryAdoptArchitectReply(reply.Text))
+                {
+                    if (reply.Text.Trim().Length > 0)
+                        history.Add(new ChatMessage { Role = "assistant", Content = JsonValue.Create(reply.Text) });
+                    history.Add(new ChatMessage
+                    {
+                        Role = "user",
+                        Content = JsonValue.Create(
+                            "Архитектура и план сохранены в .IntellectHub. Продолжай в режиме Код: " +
+                            "вызови инструменты write/edit и создай файлы проекта в корне. " +
+                            "Не спрашивай разрешения и не выводи содержимое файлов текстом.")
+                    });
+                    Wire.TraceId = turnId;
+                    Wire.Write("turn", "architect artifacts ready · continuing in code mode");
+                    continue;
+                }
+
+                // В режиме Код модель тоже иногда отвечает текстом, не создав файлов.
+                // Даём до двух жёстких напоминаний, затем завершаем ход как обычно.
+                if (_modes.Effective == Mode.Code && !_modes.State.CodeReady && modeNudges < 2)
+                {
+                    modeNudges++;
+                    if (reply.Text.Trim().Length > 0)
+                        history.Add(new ChatMessage { Role = "assistant", Content = JsonValue.Create(reply.Text) });
+                    history.Add(new ChatMessage
+                    {
+                        Role = "user",
+                        Content = JsonValue.Create(
+                            "Ты в режиме Код. Не объясняй и не спрашивай разрешения — вызови инструменты " +
+                            "write/edit и запиши файлы проекта. Не выводи код текстом. " +
+                            "Если работа уже выполнена, напиши краткий отчёт.")
+                    });
+                    Wire.TraceId = turnId;
+                    Wire.Write("turn", "text-only reply in auto/code · nudging model to use tools ({0}/2)", modeNudges);
+                    continue;
+                }
+            }
+
             // Если модель вернула пустой noop-вызов без текста — она не справилась с
             // задачей за один ход. Предлагаем ей разбить задачу на подзадачи.
             if (_planner is null && string.IsNullOrWhiteSpace(reply.Text.Trim()))
@@ -489,53 +574,58 @@ async Task RunTurnCoreAsync(CancellationToken ct)
 
             if (_planner is not null)
             {
-                var currentSubtask = _planner.Current!;
-                currentSubtask.Attempts++;
-
-                // Если модель вернула пустой текст или только placeholder-вызов,
-                // подзадача не выполнена — просим модель написать содержимое раздела
-                // повторно, не пропуская её.
-                if (string.IsNullOrWhiteSpace(reply.Text.Trim()) || allPlaceholder)
+                var currentSubtask = _planner.Current;
+                if (currentSubtask is not null)
                 {
                     const int maxAttempts = 3;
-                    if (currentSubtask.Attempts >= maxAttempts)
-                    {
-                        // Слишком много попыток — помечаем подзадачу как Failed и переходим к следующей.
-                        screen.Write($"Подзадача {currentSubtask.Index + 1} не выполнена после {maxAttempts} попыток — пропускаем.", ConsoleColor.Red);
-                        _planner.MarkCurrentFailed("Model returned empty or placeholder responses too many times.");
-                        Wire.TraceId = turnId;
-                        Wire.Write("turn", "subtask {0} failed after {1} attempts · skipping", currentSubtask.Index + 1, maxAttempts);
+                    var isLastSubtask = !_planner.HasNext;
 
-                        // Добавляем в историю сообщение о неудаче, чтобы модель знала об этом.
-                        var failContent = new JsonArray();
-                        failContent.Add(new JsonObject { ["type"] = "text", ["text"] = $"[Подзадача {currentSubtask.Index + 1} не выполнена — пропускаем]" });
-                        history.Add(new ChatMessage { Role = "assistant", Content = failContent });
-                    }
-                    else
+                    // 1. Пустой ответ/placeholder: если файлы уже записаны, это просто
+                    //    отсутствие отчёта — завершаем подзадачу. Иначе просим повторить.
+                    if (string.IsNullOrWhiteSpace(reply.Text.Trim()) || allPlaceholder)
                     {
-                        screen.Write($"Подзадача {currentSubtask.Index + 1} не выполнена — модель не прислала содержимое, повторяем запрос (попытка {currentSubtask.Attempts}/{maxAttempts}).", ConsoleColor.Yellow);
-                        var retryPrompt = new ChatMessage
+                        var wroteFiles = config.SelfCheck && HasUsedWriteTools() && VerifyWrittenFiles();
+                        if (wroteFiles)
                         {
-                            Role = "user",
-                            Content = JsonValue.Create(
-                                $"Ты должен написать содержимое подзадачи {currentSubtask.Index + 1} из {_planner.Total}: \"{currentSubtask.Title}\".\n\n" +
-                                $"Описание: {currentSubtask.Description}\n\n" +
-                                $"Напиши текст раздела целиком, используя инструмент write/edit. Не присылай пустой ответ и не отказывайся от инструментов.")
-                        };
-                        history.Add(retryPrompt);
-                        Wire.TraceId = turnId;
-                        Wire.Write("turn", "subtask {0} empty · retrying with stricter prompt (attempt {1}/{2})", currentSubtask.Index + 1, currentSubtask.Attempts, maxAttempts);
-                        continue; // ask model again for this subtask
+                            if (!await TryCompleteCurrentSubtask("", turnId, history, verifyBrowser: isLastSubtask))
+                                continue; // проверка не прошла — добавлен retry-промпт
+                        }
+                        else
+                        {
+                            currentSubtask.Attempts++;
+                            if (currentSubtask.Attempts >= maxAttempts)
+                            {
+                                screen.Write($"Подзадача {currentSubtask.Index + 1} не выполнена после {maxAttempts} попыток — пропускаем.", ConsoleColor.Red);
+                                _planner.MarkCurrentFailed("Model returned empty or placeholder responses too many times.");
+                                Wire.TraceId = turnId;
+                                Wire.Write("turn", "subtask {0} failed after {1} attempts · skipping", currentSubtask.Index + 1, maxAttempts);
+
+                                var failContent = new JsonArray();
+                                failContent.Add(new JsonObject { ["type"] = "text", ["text"] = $"[Подзадача {currentSubtask.Index + 1} не выполнена — пропускаем]" });
+                                history.Add(new ChatMessage { Role = "assistant", Content = failContent });
+                            }
+                            else
+                            {
+                                screen.Write($"Подзадача {currentSubtask.Index + 1} не выполнена — модель не прислала содержимое, повторяем запрос (попытка {currentSubtask.Attempts}/{maxAttempts}).", ConsoleColor.Yellow);
+                                var retryPrompt = new ChatMessage
+                                {
+                                    Role = "user",
+                                    Content = JsonValue.Create(
+                                        $"Ты должен написать содержимое подзадачи {currentSubtask.Index + 1} из {_planner.Total}: \"{currentSubtask.Title}\".\n\n" +
+                                        $"Описание: {currentSubtask.Description}\n\n" +
+                                        $"Напиши текст раздела целиком, используя инструмент write/edit. Не присылай пустой ответ и не отказывайся от инструментов.")
+                                };
+                                history.Add(retryPrompt);
+                                Wire.TraceId = turnId;
+                                Wire.Write("turn", "subtask {0} empty · retrying with stricter prompt (attempt {1}/{2})", currentSubtask.Index + 1, currentSubtask.Attempts, maxAttempts);
+                                continue; // ask model again for this subtask
+                            }
+                        }
                     }
-                }
-                else
-                {
-                    // Модель закончила текущую подзадачу (текст без вызовов инструментов).
-                    // Self-check: проверяем, что модель вызвала инструменты (write/edit) в текущем или предыдущих шагах.
-                    if (config.SelfCheck && !HasUsedWriteTools())
+                    // 2. Модель ответила текстом, но ни разу не использовала write/edit.
+                    else if (config.SelfCheck && !HasUsedWriteTools())
                     {
                         currentSubtask.Attempts++;
-                        const int maxAttempts = 3;
                         if (currentSubtask.Attempts >= maxAttempts)
                         {
                             screen.Write($"Подзадача {currentSubtask.Index + 1} не выполнена после {maxAttempts} попыток (модель не использовала инструменты) — пропускаем.", ConsoleColor.Red);
@@ -562,85 +652,85 @@ async Task RunTurnCoreAsync(CancellationToken ct)
                             continue;
                         }
                     }
+                    // 3. Модель написала файлы и прислала отчёт: проверяем файлы и
+                    //    браузер и завершаем подзадачу ровно один раз.
+                    else if (config.SelfCheck)
+                    {
+                        if (!await TryCompleteCurrentSubtask(reply.Text.Trim(), turnId, history, verifyBrowser: isLastSubtask))
+                            continue; // проверка не прошла — добавлен retry-промпт
+
+                        var assistantContent = new JsonArray();
+                        if (reply.Text.Trim().Length > 0)
+                            assistantContent.Add(new JsonObject { ["type"] = "text", ["text"] = reply.Text });
+                        history.Add(new ChatMessage { Role = "assistant", Content = assistantContent });
+                    }
+                    // 4. Self-check выключен: принимаем отчёт без проверки.
                     else
                     {
-                        // Верифицируем, что файлы, которые модель собиралась записать, реально существуют.
-                        if (!VerifyWrittenFiles())
-                        {
-                            currentSubtask.Attempts++;
-                            const int maxAttempts = 3;
-                            if (currentSubtask.Attempts >= maxAttempts)
-                            {
-                                screen.Write($"Подзадача {currentSubtask.Index + 1} не выполнена после {maxAttempts} попыток (файлы не созданы) — пропускаем.", ConsoleColor.Red);
-                                _planner.MarkCurrentFailed("Written files do not exist after multiple attempts.");
-                                Wire.TraceId = turnId;
-                                Wire.Write("turn", "subtask {0} failed (files missing) · skipping", currentSubtask.Index + 1);
-                                var failContent = new JsonArray();
-                                failContent.Add(new JsonObject { ["type"] = "text", ["text"] = $"[Подзадача {currentSubtask.Index + 1} не выполнена — файлы не созданы]" });
-                                history.Add(new ChatMessage { Role = "assistant", Content = failContent });
-                            }
-                            else
-                            {
-                                screen.Write($"Подзадача {currentSubtask.Index + 1}: файлы не найдены на диске, повторяем (попытка {currentSubtask.Attempts}/{maxAttempts}).", ConsoleColor.Yellow);
-                                var retryPrompt = new ChatMessage
-                                {
-                                    Role = "user",
-                                    Content = JsonValue.Create(
-                                        $"Ты должен записать файлы для подзадачи {currentSubtask.Index + 1} из {_planner.Total}: \"{currentSubtask.Title}\".\n\n" +
-                                        $"Описание: {currentSubtask.Description}\n\n" +
-                                        $"ИСПОЛЬЗУЙ ИНСТРУМЕНТЫ write/edit, чтобы создать файлы на диске. " +
-                                        $"Перед завершением убедись, что файлы реально существуют. " +
-                                        $"НЕ ВЫВОДИ ТЕКСТ В ОТВЕТЕ — используй инструменты.")
-                                };
-                                history.Add(retryPrompt);
-                                Wire.TraceId = turnId;
-                                Wire.Write("turn", "subtask {0} files missing · retrying (attempt {1}/{2})", currentSubtask.Index + 1, currentSubtask.Attempts, maxAttempts);
-                                continue;
-                            }
-                        }
-                        else
-                        {
-                            _planner.MarkCurrentDone(reply.Text.Trim());
-                            screen.Write($"Подзадача {currentSubtask.Index + 1} готова.", ConsoleColor.Green);
-
-                            var assistantContent = new JsonArray();
-                            if (reply.Text.Trim().Length > 0)
-                                assistantContent.Add(new JsonObject { ["type"] = "text", ["text"] = reply.Text });
-                            history.Add(new ChatMessage { Role = "assistant", Content = assistantContent });
-                        }
+                        _planner.MarkCurrentDone(reply.Text.Trim());
+                        screen.Write($"Подзадача {currentSubtask.Index + 1} готова.", ConsoleColor.Green);
+                        history.Add(new ChatMessage { Role = "assistant", Content = JsonValue.Create(reply.Text) });
                     }
-                }
 
-                // Если модель использовала write/edit в текущей подзадаче — считаем её выполненной.
-                if (_planner is not null && config.SelfCheck && HasUsedWriteTools())
-                {
-                    if (!await TryCompleteCurrentSubtask(reply.Text.Trim(), turnId, history))
+                    // 5. Следующая подзадача или завершение плана.
+                    if (_planner is not null && _planner.HasNext)
                     {
-                        continue; // retry: файлы не найдены, повторим запрос
+                        Wire.TraceId = turnId;
+                        Wire.Write("turn", "subtask done · continuing with subtask {0}/{1}",
+                            _planner.Current!.Index + 1, _planner.Total);
+                        continue; // execute next subtask
+                    }
+
+                    if (_planner is not null && !_planner.HasNext)
+                    {
+                        screen.Write("Все подзадачи выполнены.", ConsoleColor.Green);
+                        _planner = null;
+
+                        // Переходим к следующему режиму по порядку (Architect → Code → Debug → Code …).
+                        _modes?.AdvanceToNextMode();
+
+                        // Back to the turn id: the step loop overwrote it.
+                        Wire.TraceId = turnId;
+                        Wire.Write("turn", "done · all subtasks complete · {0} steps · {1} msgs in history", step + 1, history.Count);
+                        Wire.Timing("turn.end", turnClock, "finished");
+                        return;
                     }
                 }
+            }
 
-                if (_planner is not null && _planner.HasNext)
+            // If we forced tool use but got text without tool calls, retry with stricter prompt.
+            // This handles models (especially local ones) that ignore tool_choice: required.
+            if (forceToolUse && !reply.HasToolCalls)
+            {
+                const int maxForceRetries = 3;
+                if (!hasForceRetried)
                 {
-                    Wire.TraceId = turnId;
-                    Wire.Write("turn", "subtask done · continuing with subtask {0}/{1}",
-                        _planner.Current!.Index + 1, _planner.Total);
-                    continue; // execute next subtask
+                    _forceRetryCount = 0;
+                    hasForceRetried = true;
                 }
 
-                if (_planner is not null && !_planner.HasNext)
+                if (_forceRetryCount < maxForceRetries)
                 {
-                    screen.Write("Все подзадачи выполнены.", ConsoleColor.Green);
-                    _planner = null;
-
-                    // Переходим к следующему режиму по порядку (Architect → Code → Debug → Code …).
-                    _modes?.AdvanceToNextMode();
-
-                    // Back to the turn id: the step loop overwrote it.
+                    _forceRetryCount++;
+                    screen.Write($"Модель не использовала инструменты (forceToolUse) — повторяем запрос (попытка {_forceRetryCount}/{maxForceRetries}).", ConsoleColor.Yellow);
+                    var retryPrompt = new ChatMessage
+                    {
+                        Role = "user",
+                        Content = JsonValue.Create(
+                            "Ты должен использовать инструменты write/edit для записи файлов. " +
+                            "НЕ ВЫВОДИ ТЕКСТ В ОТВЕТЕ — используй инструменты для записи в файл. " +
+                            "НЕ ПИШИ СКРИПТЫ В ОТВЕТЕ — используй инструмент bash для выполнения команд. " +
+                            "Вызови write для каждого файла, который нужно создать.")
+                    };
+                    history.Add(retryPrompt);
                     Wire.TraceId = turnId;
-                    Wire.Write("turn", "done · all subtasks complete · {0} steps · {1} msgs in history", step + 1, history.Count);
-                    Wire.Timing("turn.end", turnClock, "finished");
-                    return;
+                    Wire.Write("turn", "forceToolUse ignored · retrying with stricter prompt (attempt {0}/{1})", _forceRetryCount, maxForceRetries);
+                    continue; // next loop iteration will ask model again
+                }
+                else
+                {
+                    screen.Write("Модель не использовала инструменты после 3 попыток с forceToolUse — прерываем.", ConsoleColor.Red);
+                    Wire.Write("turn", "forceToolUse failed after 3 retries · aborting");
                 }
             }
 
@@ -671,71 +761,10 @@ async Task RunTurnCoreAsync(CancellationToken ct)
         }
         history.Add(new ChatMessage { Role = "assistant", Content = assistantContent2 });
 
-        // Self-check: если модель вызвала write/edit в текущей подзадаче — считаем, что задача выполнена.
-        if (_planner is not null && config.SelfCheck && HasUsedWriteTools())
-        {
-            var currentSubtask = _planner.Current!;
-
-            // Верифицируем, что файлы, которые модель собралась записать, реально существуют на диске.
-            if (!VerifyWrittenFiles())
-            {
-                currentSubtask.Attempts++;
-                const int maxAttempts = 3;
-                if (currentSubtask.Attempts >= maxAttempts)
-                {
-                    screen.Write($"Подзадача {currentSubtask.Index + 1} не выполнена после {maxAttempts} попыток (файлы не созданы) — пропускаем.", ConsoleColor.Red);
-                    _planner.MarkCurrentFailed("Written files do not exist after multiple attempts.");
-                    Wire.TraceId = turnId;
-                    Wire.Write("turn", "subtask {0} failed (files missing) · skipping", currentSubtask.Index + 1);
-                    var failContent = new JsonArray();
-                    failContent.Add(new JsonObject { ["type"] = "text", ["text"] = $"[Подзадача {currentSubtask.Index + 1} не выполнена — файлы не созданы]" });
-                    history.Add(new ChatMessage { Role = "assistant", Content = failContent });
-                }
-                else
-                {
-                    screen.Write($"Подзадача {currentSubtask.Index + 1}: файлы не найдены на диске, повторяем (попытка {currentSubtask.Attempts}/{maxAttempts}).", ConsoleColor.Yellow);
-                    var retryPrompt = new ChatMessage
-                    {
-                        Role = "user",
-                        Content = JsonValue.Create(
-                            $"Ты должен записать файлы для подзадачи {currentSubtask.Index + 1} из {_planner.Total}: \"{currentSubtask.Title}\".\n\n" +
-                            $"Описание: {currentSubtask.Description}\n\n" +
-                            $"ИСПОЛЬЗУЙ ИНСТРУМЕНТЫ write/edit, чтобы создать файлы на диске. " +
-                            $"Перед завершением убедись, что файлы реально существуют. " +
-                            $"НЕ ВЫВОДИ ТЕКСТ В ОТВЕТЕ — используй инструменты.")
-                    };
-                    history.Add(retryPrompt);
-                    Wire.TraceId = turnId;
-                    Wire.Write("turn", "subtask {0} files missing · retrying (attempt {1}/{2})", currentSubtask.Index + 1, currentSubtask.Attempts, maxAttempts);
-                    continue;
-                }
-            }
-            else
-            {
-                _planner.MarkCurrentDone(reply.Text.Trim());
-                screen.Write($"Подзадача {currentSubtask.Index + 1} готова (инструменты использованы, файлы проверены).", ConsoleColor.Green);
-
-                if (_planner.HasNext)
-                {
-                    Wire.TraceId = turnId;
-                    Wire.Write("turn", "subtask done (tools used) · continuing with subtask {0}/{1}",
-                        _planner.Current!.Index + 1, _planner.Total);
-                    continue; // execute next subtask
-                }
-
-                screen.Write("Все подзадачи выполнены.", ConsoleColor.Green);
-                _planner = null;
-
-                // Переходим к следующему режиму по порядку (Architect → Code → Debug → Code …).
-                _modes?.AdvanceToNextMode();
-
-                // Back to the turn id: the step loop overwrote it.
-                Wire.TraceId = turnId;
-                Wire.Write("turn", "done · all subtasks complete · {0} steps · {1} msgs in history", step + 1, history.Count);
-                Wire.Timing("turn.end", turnClock, "finished");
-                return;
-            }
-        }
+        // Подзадача завершается только после выполнения инструментов и
+        // текстового отчёта модели (см. ветку без tool calls выше). Раньше здесь
+        // стояла проверка HasUsedWriteTools() — но она срабатывала ДО выполнения
+        // текущих вызовов, поэтому следующий write/edit мог быть пропущен.
 
         var results = new JsonArray();
         var stop = false;
@@ -827,7 +856,7 @@ async Task RunTurnCoreAsync(CancellationToken ct)
                 Wire.Json("tool.args", call.Arguments);
 
                 // Self-check: отслеживаем использование инструментов write/edit в текущей подзадаче.
-                if (call.Name is "write" or "edit" or "question")
+                if (call.Name is "write" or "edit")
                 {
                     _hasUsedWriteTools = true;
                     var path = ReadArg(call.Arguments, "path");
@@ -878,9 +907,21 @@ async Task RunTurnCoreAsync(CancellationToken ct)
                     ["is_error"] = result.IsError,
                 });
 
+                // Don't pause for client-side validation errors (missing args, invalid JSON).
+                // These are fixable by the model immediately - let it retry in the next step.
+                // Execution errors (file not found, permissions, etc.) should still pause.
+                var isValidationError = result.IsError &&
+                    (result.Output.StartsWith("Missing required arguments:", StringComparison.Ordinal) ||
+                     result.Output.StartsWith("Invalid arguments:", StringComparison.Ordinal) ||
+                     result.Output.StartsWith("oldString not found", StringComparison.Ordinal) ||
+                     result.Output.StartsWith("oldString is not unique", StringComparison.Ordinal) ||
+                     result.Output.StartsWith("path is empty", StringComparison.Ordinal) ||
+                     result.Output.StartsWith("path names no file", StringComparison.Ordinal) ||
+                     result.Output.StartsWith("Path escapes workspace", StringComparison.Ordinal));
+
                 // При ошибке инструмента — ОСТАНАВЛИВАЕМ ход, не продолжаем нестись дальше.
                 // Модель получит ошибку в следующем ходе и должна её исправить.
-                if (result.IsError)
+                if (result.IsError && !isValidationError)
                 {
                     stop = true;
                     break;
@@ -895,29 +936,10 @@ async Task RunTurnCoreAsync(CancellationToken ct)
 
         history.Add(new ChatMessage { Role = "user", Content = results });
 
-        // Если модель использовала write/edit для текущей подзадача — завершаем её.
-        if (_planner is not null && config.SelfCheck && HasUsedWriteTools())
-        {
-            if (!await TryCompleteCurrentSubtask("", turnId, history))
-            {
-                continue; // повторить запрос: файлы не найдены
-            }
-
-            // Все подзадачи выполнены — сбрасываем планировщик и переходим к следующему режиму.
-            if (_planner is not null && !_planner.HasNext)
-            {
-                screen.Write("Все подзадачи выполнены.", ConsoleColor.Green);
-                _planner = null;
-
-                // Переходим к следующему режиму по порядку (Architect → Code → Debug → Code …).
-                _modes?.AdvanceToNextMode();
-
-                Wire.TraceId = turnId;
-                Wire.Write("turn", "done · all subtasks complete (tools path) · {0} steps · {1} msgs in history", step + 1, history.Count);
-                Wire.Timing("turn.end", turnClock, "finished");
-                return;
-            }
-        }
+        // Подзадача завершается в текстовой ветке, после отчёта модели.
+        // Здесь раньше стояло завершение сразу после write: браузерная проверка
+        // запускалась до того, как модель закончила шаг, и подзадача уходила в
+        // бесконечный retry. Текстовый путь проверяет файлы и браузер один раз.
 
         if (stop)
         {
@@ -2312,6 +2334,91 @@ static bool IsPlaceholderToolName(string name)
 }
 
 /// <summary>
+/// Если модель в Auto/Architect ответила текстом (архитектура + план), не
+/// выбрасываем этот ответ и не ждём пользователя: сохраняем его в
+/// .IntellectHub/architecture.md и plan.md и переключаемся на Code.
+/// Возвращает true, если текст удалось принять как артефакт.
+/// </summary>
+bool TryAdoptArchitectReply(string text)
+{
+    if (_modes is null || _modeStore is null) return false;
+    if (_modes.Effective != Mode.Architect) return false;
+
+    var architecture = text.Trim();
+    var anyReady = _modes.State.ArchitectureReady || _modes.State.PlanReady;
+
+    // Ничего не записано и текста нет/он слишком короткий — принять нечего.
+    if (!anyReady && architecture.Length < 40) return false;
+
+    try
+    {
+        if (!_modes.State.ArchitectureReady && !_modes.State.PlanReady)
+        {
+            // Модель ответила прозой: полный текст — архитектура, секция «План» — план.
+            _modes.RecordArtifact(Mode.Architect, ".IntellectHub/architecture.md", architecture);
+            _modeStore.SavePlan(ExtractPlanSection(architecture), _modes.State);
+        }
+        else
+        {
+            // Один артефакт уже записан инструментами. Не перезаписываем его
+            // финальным отчётом — только дополняем недостающий.
+            if (!_modes.State.ArchitectureReady)
+            {
+                var planText = _modeStore.Read(_modeStore.PlanPath);
+                if (string.IsNullOrWhiteSpace(planText)) return false;
+                _modes.RecordArtifact(Mode.Architect, ".IntellectHub/architecture.md", planText);
+            }
+
+            if (!_modes.State.PlanReady)
+            {
+                var archText = _modeStore.Read(_modeStore.ArchitecturePath);
+                var planSource = string.IsNullOrWhiteSpace(archText) ? architecture : archText;
+                if (string.IsNullOrWhiteSpace(planSource)) return false;
+                _modeStore.SavePlan(ExtractPlanSection(planSource), _modes.State);
+            }
+        }
+    }
+    catch (Exception ex)
+    {
+        Wire.Write("mode.adopt_failed", "{0}: {1}", ex.GetType().Name, ex.Message);
+        return false;
+    }
+
+    if (!_modes.State.ArchitectureReady || !_modes.State.PlanReady) return false;
+
+    _modes.AdvanceIfReady();
+    screen.Write("Архитектура и план сохранены в .IntellectHub — перехожу к коду.", ConsoleColor.Yellow);
+    Wire.Write("mode.architect_text", "architecture.md/plan.md ready · effective={0}", _modes.Effective);
+    return true;
+}
+
+/// <summary>
+/// Достаёт из текста секцию «План»/«Plan», если она есть. Иначе весь текст
+/// становится планом — лучше сохранить ответ модели, чем потерять его.
+/// </summary>
+static string ExtractPlanSection(string architecture)
+{
+    var lines = architecture.Replace("\r\n", "\n").Split('\n');
+    var start = -1;
+    for (var i = 0; i < lines.Length; i++)
+    {
+        var line = lines[i].TrimStart();
+        if (line.StartsWith("#") &&
+            (line.Contains("plan", StringComparison.OrdinalIgnoreCase) ||
+             line.Contains("план", StringComparison.OrdinalIgnoreCase)))
+        {
+            start = i;
+            break;
+        }
+    }
+
+    var body = start >= 0
+        ? string.Join("\n", lines.Skip(start)).Trim()
+        : architecture;
+    return "# План реализации\n\n" + body;
+}
+
+/// <summary>
 /// Self-check: проверяет, использовала ли модель инструменты write/edit в текущем или предыдущих шагах.
 /// </summary>
 bool HasUsedWriteTools()
@@ -2357,42 +2464,46 @@ bool VerifyWrittenFiles()
     /// подзадачу как выполненную. Возвращает false, если нужен repeat-запрос
     /// (файлы не найдены и попытки не исчерпаны).
     /// </summary>
-    async Task<bool> TryCompleteCurrentSubtask(string assistantText, string traceId, List<ChatMessage> history)
+    async Task<bool> TryCompleteCurrentSubtask(string assistantText, string traceId, List<ChatMessage> history, bool verifyBrowser = true)
     {
-        // Сначала верифицируем файлы через helper
-        var fileResult = SubtaskHelpers.TryCompleteSubtask(
-            _planner!,
-            screen,
-            traceId,
-            history,
-            VerifyWrittenFiles(),
-            "файлы не созданы",
-            SubtaskHelpers.FilesMissingRetryFactory(_planner!),
-            "инструменты использованы, файлы проверены"
-        );
-
-        if (fileResult == SubtaskCompletionResult.Retry)
-            return false;
-        if (fileResult == SubtaskCompletionResult.Failed)
+        // Планировщик мог уже перейти за последнюю подзадачу (например, после
+        // предыдущей проверки). Завершать больше нечего.
+        if (_planner?.Current is null)
             return true;
 
-        // Файлы есть — дополнительно верифицируем браузер (если есть HTML)
-        var htmlFile = _writtenFiles.FirstOrDefault(f => f.EndsWith(".html", StringComparison.OrdinalIgnoreCase))
-            ?? "index.html";
-        var browserOk = await VerifyGameWorksViaPreview(htmlFile, traceId);
-        
-        var browserResult = SubtaskHelpers.TryCompleteSubtask(
+        // Сначала проверяем файлы. Если их нет — браузер проверять бессмысленно.
+        var filesOk = VerifyWrittenFiles();
+        var browserOk = true;
+        if (filesOk && verifyBrowser)
+        {
+            var htmlFile = _writtenFiles.FirstOrDefault(f => f.EndsWith(".html", StringComparison.OrdinalIgnoreCase));
+            if (htmlFile is null && File.Exists(Path.Combine(project.Root, "index.html")))
+                htmlFile = "index.html";
+
+            // На ранних подзадачах (архитектура, стили, скрипт) HTML может ещё
+            // не существовать. Проверять нечего — не превращаем это в retry.
+            if (htmlFile is not null)
+                browserOk = await VerifyGameWorksViaPreview(htmlFile, traceId);
+        }
+
+        // Обе проверки выполняются ДО завершения подзадачи. Раньше helper вызывался
+        // дважды: первый вызов помечал подзадачу выполненной и сдвигал планировщик,
+        // второй — помечал выполненной уже следующую (или падал на null в конце).
+        // Из-за этого пропускалась каждая вторая подзадача, а на последней
+        // возникал NullReferenceException.
+        var result = SubtaskHelpers.TryCompleteSubtask(
             _planner!,
             screen,
             traceId,
             history,
-            browserOk,
-            "ошибки в браузере",
-            SubtaskHelpers.BrowserErrorsRetryFactory(_planner!),
-            "инструменты использованы, файлы проверены, браузер ОК"
-        );
+            filesOk && browserOk,
+            filesOk ? "ошибки в браузере" : "файлы не созданы",
+            filesOk
+                ? SubtaskHelpers.BrowserErrorsRetryFactory(_planner!)
+                : SubtaskHelpers.FilesMissingRetryFactory(_planner!),
+            "инструменты использованы, файлы проверены, браузер ОК");
 
-        return browserResult != SubtaskCompletionResult.Retry;
+        return result != SubtaskCompletionResult.Retry;
     }
 
 static class Sound
